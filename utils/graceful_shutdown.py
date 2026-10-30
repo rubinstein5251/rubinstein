@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-import sys
 import threading
 from typing import Any, Awaitable, Callable, List, Optional
 
@@ -13,9 +12,13 @@ _BANNER = "=" * 40
 _TITLE = "POLYMARKET BOT"
 
 _lock = threading.Lock()
+_async_lock: Optional[asyncio.Lock] = None
 _shutdown_event: Optional[asyncio.Event] = None
 _shutdown_started = False
 _shutdown_complete = False
+_shutdown_scheduled = False
+_sigint_count = 0
+_active_shutdown: Optional[asyncio.Task] = None
 _hooks: List[Callable[[], Awaitable[None]]] = []
 _background_tasks: List[asyncio.Task] = []
 
@@ -26,6 +29,13 @@ def _log(msg: str) -> None:
 
 def _warn(msg: str) -> None:
     print(f"[WARN] {msg}")
+
+
+def _asyncio_lock() -> asyncio.Lock:
+    global _async_lock
+    if _async_lock is None:
+        _async_lock = asyncio.Lock()
+    return _async_lock
 
 
 def shutdown_requested() -> bool:
@@ -51,11 +61,10 @@ def track_background_task(task: asyncio.Task) -> None:
     task.add_done_callback(lambda t: _background_tasks.remove(t) if t in _background_tasks else None)
 
 
-async def graceful_shutdown(*, reason: str = "Shutdown signal") -> None:
+async def _run_shutdown_body(*, reason: str) -> None:
     global _shutdown_started, _shutdown_complete
     with _lock:
         if _shutdown_started:
-            _warn("Shutdown already in progress")
             return
         _shutdown_started = True
 
@@ -110,18 +119,77 @@ async def graceful_shutdown(*, reason: str = "Shutdown signal") -> None:
     _shutdown_complete = True
 
 
-def _sync_signal_handler(signum: int, frame: Any) -> None:
-    name = "Ctrl+C" if signum == signal.SIGINT else f"signal {signum}"
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(graceful_shutdown(reason=name))
+async def graceful_shutdown(*, reason: str = "Shutdown signal") -> None:
+    """Run shutdown once; concurrent callers await the same in-flight shutdown."""
+    global _active_shutdown
+    if _shutdown_complete:
+        return
+
+    async with _asyncio_lock():
+        if _shutdown_complete:
             return
+        if _active_shutdown is not None:
+            task = _active_shutdown
+        else:
+            get_shutdown_event().set()
+            _active_shutdown = asyncio.create_task(
+                _run_shutdown_body(reason=reason),
+                name="graceful-shutdown",
+            )
+            task = _active_shutdown
+
+    try:
+        await task
+    finally:
+        async with _asyncio_lock():
+            if _active_shutdown is task and task.done():
+                _active_shutdown = None
+
+
+def _schedule_shutdown_from_signal(reason: str) -> None:
+    """Schedule at most one shutdown task on the running event loop."""
+    try:
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        pass
-    with _lock:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            get_shutdown_event().set()
+            _log(f"Shutdown signal received ({reason})")
+            return
+
+    if not loop.is_running():
         get_shutdown_event().set()
-    _log(f"Shutdown signal received ({name})")
+        return
+
+    def _kick() -> None:
+        global _active_shutdown
+        if _shutdown_complete:
+            return
+        if _active_shutdown is not None and not _active_shutdown.done():
+            return
+        asyncio.create_task(graceful_shutdown(reason=reason), name="graceful-shutdown-signal")
+
+    loop.call_soon_threadsafe(_kick)
+
+
+def _sync_signal_handler(signum: int, frame: Any) -> None:
+    global _sigint_count, _shutdown_scheduled
+    name = "Ctrl+C" if signum == signal.SIGINT else f"signal {signum}"
+    get_shutdown_event().set()
+
+    with _lock:
+        if _shutdown_complete:
+            raise SystemExit(0)
+        if _shutdown_started or _shutdown_scheduled:
+            _sigint_count += 1
+            if _sigint_count >= 2:
+                _log("Second interrupt — forcing exit")
+                raise SystemExit(130)
+            return
+        _shutdown_scheduled = True
+
+    _schedule_shutdown_from_signal(name)
 
 
 def install_signal_handlers() -> None:

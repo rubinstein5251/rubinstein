@@ -1,6 +1,6 @@
 {
-  "total_pnl": 0.2,
-  "wins": 1,
+  "total_pnl": 0.7,
+  "wins": 3,
   "losses": 0,
   "win_rate": "100.0%",
   "trades": [
@@ -19,6 +19,46 @@
         "yes_unpaired": 0.0,
         "no_unpaired": 5.0,
         "total_cost": 4.8,
+        "settlement_value": 5.0,
+        "entry_count": 1,
+        "duration_seconds": -0.0
+      }
+    },
+    {
+      "timestamp": "2026-10-30 23:30:02",
+      "market": "Bitcoin Up or Down - October 30, 7:25PM-7:30PM ET",
+      "slug": "btc-updown-5m-1793402700",
+      "type": "GABAGOOL_SETTLE",
+      "pnl": 0.25,
+      "cumulative_pnl": 0.45,
+      "details": {
+        "outcome": "NO",
+        "yes_shares": 0.0,
+        "no_shares": 5.0,
+        "matched_pairs": 0.0,
+        "yes_unpaired": 0.0,
+        "no_unpaired": 5.0,
+        "total_cost": 4.75,
+        "settlement_value": 5.0,
+        "entry_count": 1,
+        "duration_seconds": -0.0
+      }
+    },
+    {
+      "timestamp": "2026-10-30 23:40:00",
+      "market": "Bitcoin Up or Down - October 30, 7:35PM-7:40PM ET",
+      "slug": "btc-updown-5m-1793403300",
+      "type": "GABAGOOL_SETTLE",
+      "pnl": 0.25,
+      "cumulative_pnl": 0.7,
+      "details": {
+        "outcome": "NO",
+        "yes_shares": 0.0,
+        "no_shares": 5.0,
+        "matched_pairs": 0.0,
+        "yes_unpaired": 0.0,
+        "no_unpaired": 5.0,
+        "total_cost": 4.75,
         "settlement_value": 5.0,
         "entry_count": 1,
         "duration_seconds": -0.0

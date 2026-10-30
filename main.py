@@ -2121,9 +2121,10 @@ function renderBots(bots){
     if(!card){
       card=document.createElement('div');
       card.id=`bot-card-${i}`;
-      card.className='card bg-zinc-900 rounded-3xl p-5 md:p-6';
       c.appendChild(card);
     }
+    const pnlBorder = _botCardPnlBorderClass(bot);
+    card.className = ['card', 'bg-zinc-900', 'rounded-3xl', 'p-5', 'md:p-6', pnlBorder].filter(Boolean).join(' ');
     card.innerHTML=renderCard(bot);
   });
   // Remove stale cards when asset count decreases (e.g. config change).
@@ -2156,10 +2157,43 @@ function _fmtCooldownRemaining(sec) {
   return `${m}m ${String(r).padStart(2, '0')}s`;
 }
 
+function _botHasInventory(bot) {
+  const ySh = Number(bot.yes_shares) || 0;
+  const nSh = Number(bot.no_shares) || 0;
+  if (ySh > 0 || nSh > 0) return true;
+  const side = String(bot.position_side || '').trim();
+  const sz = Number(bot.position_size) || 0;
+  return side.length > 0 && sz > 0;
+}
+
+function _botCardPnlBorderClass(bot) {
+  const hasInv = _botHasInventory(bot);
+  const positionRow = _fmtPositionRow(bot);
+  const hasPos = positionRow !== '-' || hasInv;
+  const unrealized = Number(bot.pnl_dollars) || 0;
+  const inProfit = hasInv && unrealized > 0;
+  const inLoss = hasInv && unrealized < 0;
+  if (inProfit) return 'border-l-4 border-l-accent';
+  if (inLoss) return 'border-l-4 border-red-500';
+  if (hasPos) return 'border-l-4 border-sky-500';
+  return '';
+}
+
 function _fmtPositionRow(bot) {
   const ySh = Number(bot.yes_shares) || 0;
   const nSh = Number(bot.no_shares) || 0;
-  if (ySh <= 0 && nSh <= 0) return '-';
+  if (ySh <= 0 && nSh <= 0) {
+    const side = String(bot.position_side || '').toUpperCase();
+    const sz = Number(bot.position_size) || 0;
+    if (side && sz > 0) {
+      const fillC = Number(bot.entry_fill_price_c) || 0;
+      const cost = sz * fillC / 100;
+      return `${side} @ $${_fmtMoney(cost)}`;
+    }
+    const pos = String(bot.position || '').trim();
+    if (pos && pos !== '-') return pos;
+    return '-';
+  }
   const parts = [];
   let yesCost = 0;
   let noCost = 0;
@@ -2177,14 +2211,13 @@ function _fmtPositionRow(bot) {
 }
 
 function renderCard(bot){
-  const hasInv=(bot.yes_shares||0)>0||(bot.no_shares||0)>0;
+  const hasInv = _botHasInventory(bot);
   const positionRow = _fmtPositionRow(bot);
   const hasPos = positionRow !== '-' || hasInv;
   const pnlPos=(bot.pnl_dollars||0)>=0;
   const cumPos=(bot.cumulative_pnl||0)>=0;
   const inProfit=hasInv&&(bot.pnl_dollars||0)>0;
   const inLoss=hasInv&&(bot.pnl_dollars||0)<0;
-  const border=inProfit?'border-l-4 border-l-accent':inLoss?'border-l-4 border-red-500':hasPos?'border-l-4 border-sky-500':'';
   const stratLabel=bot.strategy_name||bot.strategy_label||'95c Entry / Stop Loss';
   const entryC=Number(bot.minimum_entry_price_c||bot.configured_entry_price_c||95);
   const limitC=Number(bot.buy_limit_price_c||0);
@@ -2220,7 +2253,7 @@ function renderCard(bot){
         <div class="font-semibold">Market blocked after stop loss — no re-entry</div>
       </div>`:'';
   return`
-    <div class="${border} rounded-2xl pl-3">
+    <div class="rounded-2xl">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2 flex-wrap">
           <span class="text-xl font-black tracking-tight" style="font-family:'Inter',system-ui,sans-serif;letter-spacing:-.02em;">${label}</span>

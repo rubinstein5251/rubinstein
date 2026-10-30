@@ -16,7 +16,7 @@
     "fill_poll_ms": 400,
     "trade_cooldown_ms": 3000,
     "listener_activate_secs": 90,
-    "dry_run": true,
+    "dry_run": false,
     "enabled": true
   },
   "workers": [
