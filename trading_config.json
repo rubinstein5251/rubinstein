@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "entry_price": 0.95,
+    "stop_loss_pct": 0.35,
+    "order_type": "FOK",
+    "order_size_min": 5,
+    "order_size_max": 5,
+    "max_order_size": 5,
+    "min_order_size": 5,
+    "max_shares": 5,
+    "min_orderbook_depth": 5,
+    "max_quote_age_seconds": 3.0,
+    "stop_loss_exit_max_retries": 5,
+    "stop_loss_exit_retry_ms": 400,
+    "fill_timeout_ms": 10000,
+    "fill_poll_ms": 400,
+    "trade_cooldown_ms": 3000,
+    "listener_activate_secs": 90,
+    "dry_run": true,
+    "enabled": true
+  },
+  "workers": [
+    {
+      "asset": "btc",
+      "window": "5m"
+    },
+    {
+      "asset": "eth",
+      "window": "5m"
+    }
+  ]
+}

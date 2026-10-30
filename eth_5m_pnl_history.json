@@ -1,0 +1,48 @@
+{
+  "total_pnl": 0.4,
+  "wins": 2,
+  "losses": 0,
+  "win_rate": "100.0%",
+  "trades": [
+    {
+      "timestamp": "2026-10-30 23:15:00",
+      "market": "Ethereum Up or Down - October 30, 7:10PM-7:15PM ET",
+      "slug": "eth-updown-5m-1793401800",
+      "type": "GABAGOOL_SETTLE",
+      "pnl": 0.2,
+      "cumulative_pnl": 0.2,
+      "details": {
+        "outcome": "NO",
+        "yes_shares": 0.0,
+        "no_shares": 5.0,
+        "matched_pairs": 0.0,
+        "yes_unpaired": 0.0,
+        "no_unpaired": 5.0,
+        "total_cost": 4.8,
+        "settlement_value": 5.0,
+        "entry_count": 1,
+        "duration_seconds": -0.0
+      }
+    },
+    {
+      "timestamp": "2026-10-30 23:20:01",
+      "market": "Ethereum Up or Down - October 30, 7:15PM-7:20PM ET",
+      "slug": "eth-updown-5m-1793402100",
+      "type": "GABAGOOL_SETTLE",
+      "pnl": 0.2,
+      "cumulative_pnl": 0.4,
+      "details": {
+        "outcome": "NO",
+        "yes_shares": 0.0,
+        "no_shares": 5.0,
+        "matched_pairs": 0.0,
+        "yes_unpaired": 0.0,
+        "no_unpaired": 5.0,
+        "total_cost": 4.8,
+        "settlement_value": 5.0,
+        "entry_count": 1,
+        "duration_seconds": -0.0
+      }
+    }
+  ]
+}

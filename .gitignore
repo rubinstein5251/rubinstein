@@ -1,0 +1,6 @@
+virtual_env/
+/__pycache__/
+*.pyc
+.env
+rubinstein
+rubinstein.pub

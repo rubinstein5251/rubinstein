@@ -1,0 +1,80 @@
+[
+  {
+    "id": "eth:eth-updown-5m-1793401800:buy:NO:1793405615000:0.96:5.0",
+    "timestamp": "2026-10-31 00:13:35",
+    "timestamp_ms": 1793405615000,
+    "asset": "ETH",
+    "market": "Ethereum Up or Down - October 30, 7:10PM-7:15PM ET",
+    "slug": "eth-updown-5m-1793401800",
+    "action": "buy",
+    "side": "NO",
+    "price": 0.96,
+    "size": 5.0,
+    "window": "5m"
+  },
+  {
+    "id": "eth:eth-updown-5m-1793401800:redeem:NO:1793405700000:1.0:5.0",
+    "timestamp": "2026-10-31 00:15:00",
+    "timestamp_ms": 1793405700000,
+    "asset": "ETH",
+    "market": "Ethereum Up or Down - October 30, 7:10PM-7:15PM ET",
+    "slug": "eth-updown-5m-1793401800",
+    "action": "redeem",
+    "side": "NO",
+    "price": 1.0,
+    "size": 5.0,
+    "window": "5m"
+  },
+  {
+    "id": "btc:btc-updown-5m-1793402100:buy:NO:1793405937000:0.96:5.0",
+    "timestamp": "2026-10-31 00:18:57",
+    "timestamp_ms": 1793405937000,
+    "asset": "BTC",
+    "market": "Bitcoin Up or Down - October 30, 7:15PM-7:20PM ET",
+    "slug": "btc-updown-5m-1793402100",
+    "action": "buy",
+    "side": "NO",
+    "price": 0.96,
+    "size": 5.0,
+    "window": "5m"
+  },
+  {
+    "id": "eth:eth-updown-5m-1793402100:buy:NO:1793405961000:0.96:5.0",
+    "timestamp": "2026-10-31 00:19:21",
+    "timestamp_ms": 1793405961000,
+    "asset": "ETH",
+    "market": "Ethereum Up or Down - October 30, 7:15PM-7:20PM ET",
+    "slug": "eth-updown-5m-1793402100",
+    "action": "buy",
+    "side": "NO",
+    "price": 0.96,
+    "size": 5.0,
+    "window": "5m"
+  },
+  {
+    "id": "btc:btc-updown-5m-1793402100:redeem:NO:1793406001000:1.0:5.0",
+    "timestamp": "2026-10-31 00:20:01",
+    "timestamp_ms": 1793406001000,
+    "asset": "BTC",
+    "market": "Bitcoin Up or Down - October 30, 7:15PM-7:20PM ET",
+    "slug": "btc-updown-5m-1793402100",
+    "action": "redeem",
+    "side": "NO",
+    "price": 1.0,
+    "size": 5.0,
+    "window": "5m"
+  },
+  {
+    "id": "eth:eth-updown-5m-1793402100:redeem:NO:1793406001000:1.0:5.0",
+    "timestamp": "2026-10-31 00:20:01",
+    "timestamp_ms": 1793406001000,
+    "asset": "ETH",
+    "market": "Ethereum Up or Down - October 30, 7:15PM-7:20PM ET",
+    "slug": "eth-updown-5m-1793402100",
+    "action": "redeem",
+    "side": "NO",
+    "price": 1.0,
+    "size": 5.0,
+    "window": "5m"
+  }
+]
