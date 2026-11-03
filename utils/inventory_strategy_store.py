@@ -260,6 +260,20 @@ class InventoryStrategyStore:
             "ts": float(raw.get("ts") or 0),
         }
 
+    @staticmethod
+    def _merge_side_slot(slot: dict, qty: float, price: float) -> dict:
+        old_q = float(slot.get("qty") or 0)
+        px = float(price)
+        add_q = float(qty)
+        if add_q <= 0:
+            return dict(slot)
+        if old_q <= 1e-12:
+            return {"qty": add_q, "price": px, "price_c": round(px * 100.0, 2)}
+        old_px = float(slot.get("price") or 0)
+        new_q = old_q + add_q
+        avg = (old_q * old_px + add_q * px) / new_q
+        return {"qty": new_q, "price": avg, "price_c": round(avg * 100.0, 2)}
+
     def record_cycle_leg_fill(
         self,
         rec: MarketCycleRecord,
@@ -270,23 +284,45 @@ class InventoryStrategyStore:
         price: float,
         kind: str = "",
     ) -> None:
-        key = "first_leg" if leg == "first" else "second_leg"
+        """``leg`` is ``hedge`` (ideal/emergency) or ``dca`` (average-down / rebalance)."""
+        bucket = str(leg or "").strip().lower()
+        if bucket not in ("hedge", "dca"):
+            raise ValueError(f"invalid leg bucket {leg!r}; use hedge or dca")
+        key = "hedge_fills" if bucket == "hedge" else "dca_fills"
         rec.metadata.setdefault("entries", {})
         side_u = str(side).upper()
         px = float(price)
-        legs = self._empty_leg_legs()
-        if side_u in legs:
-            legs[side_u] = {
-                "qty": float(qty),
-                "price": px,
-                "price_c": round(px * 100.0, 2),
-            }
+        prior = self.normalize_leg_fill(dict(rec.metadata.get(key) or {}))
+        yes_slot = dict(prior["YES"])
+        no_slot = dict(prior["NO"])
+        if side_u == "YES":
+            yes_slot = self._merge_side_slot(yes_slot, qty, px)
+        elif side_u == "NO":
+            no_slot = self._merge_side_slot(no_slot, qty, px)
         rec.metadata[key] = {
-            **legs,
+            "YES": yes_slot,
+            "NO": no_slot,
             "ts": time.time(),
-            "kind": kind or key,
+            "kind": kind or prior.get("kind") or bucket,
         }
         self.upsert(rec)
+
+    def dashboard_fill_buckets(self, rec: Optional[MarketCycleRecord]) -> tuple[dict, dict]:
+        """First row = hedge fills; second row = DCA fills (API: first_leg_fill / second_leg_fill)."""
+        empty = self.normalize_leg_fill({})
+        if rec is None:
+            return empty, empty
+        meta = rec.metadata or {}
+        hedge_raw = meta.get("hedge_fills")
+        dca_raw = meta.get("dca_fills")
+        if not hedge_raw:
+            legacy = dict(meta.get("second_leg") or {})
+            kind = str(legacy.get("kind") or "")
+            if kind in ("ideal_hedge", "emergency_hedge", "initial_hedge_allowed", "force_hedge_after_timeout"):
+                hedge_raw = legacy
+        hedge = self.normalize_leg_fill(dict(hedge_raw or {}))
+        dca = self.normalize_leg_fill(dict(dca_raw or {}))
+        return hedge, dca
 
     def start_cycle(
         self,

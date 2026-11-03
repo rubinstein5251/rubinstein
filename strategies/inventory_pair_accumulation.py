@@ -97,22 +97,19 @@ class InventoryPairAccumulationStrategy:
         wkey = self._key(worker)
         if action == ArbitrageAction.FIRST_LEG:
             wc = worker.worker_config
-            rec = inventory_strategy_store.start_cycle(
+            inventory_strategy_store.start_cycle(
                 wkey,
                 cid,
                 first_leg_side=side,
                 hedge_delay_seconds=float(wc.initial_hedge_delay_seconds),
                 hedge_timeout_seconds=float(wc.initial_hedge_timeout_seconds),
             )
-            inventory_strategy_store.record_cycle_leg_fill(
-                rec, leg="first", side=side, qty=qty, price=fill_px, kind="first_leg",
-            )
         elif action in (ArbitrageAction.IDEAL_HEDGE, ArbitrageAction.EMERGENCY_HEDGE):
             rec = inventory_strategy_store.cycle_for_market(wkey, cid)
             if rec:
                 inventory_strategy_store.record_cycle_leg_fill(
                     rec,
-                    leg="second",
+                    leg="hedge",
                     side=side,
                     qty=qty,
                     price=fill_px,
@@ -126,6 +123,17 @@ class InventoryPairAccumulationStrategy:
                 if combined is not None and combined <= self._arb_cfg(worker).target_combined_cost + 1e-9:
                     rec.target_achieved = True
                 inventory_strategy_store.upsert(rec)
+        elif action in (ArbitrageAction.AVERAGE_DOWN, ArbitrageAction.REBALANCE):
+            rec = inventory_strategy_store.cycle_for_market(wkey, cid)
+            if rec:
+                inventory_strategy_store.record_cycle_leg_fill(
+                    rec,
+                    leg="dca",
+                    side=side,
+                    qty=qty,
+                    price=fill_px,
+                    kind=action.value,
+                )
         worker.dashboard["entry_fill_price"] = round(fill_px, 4)
         worker.dashboard["strategy_state"] = action.value
         if hasattr(worker, "sync_accounting_dashboard"):
@@ -213,17 +221,14 @@ class InventoryPairAccumulationStrategy:
         worker.dashboard["no_shares"] = round(snap.no_shares, 2)
         cid = worker.canonical_market_id() or ""
         rec = inventory_strategy_store.cycle_for_market(self._key(worker), cid)
+        hedge_fill, dca_fill = inventory_strategy_store.dashboard_fill_buckets(rec)
+        worker.dashboard["first_leg_fill"] = hedge_fill
+        worker.dashboard["second_leg_fill"] = dca_fill
+        worker.dashboard["hedge_fills"] = hedge_fill
+        worker.dashboard["dca_fills"] = dca_fill
         if rec:
             worker.dashboard["hedge_deadline_at"] = rec.hedge_deadline_at
             worker.dashboard["accumulation_phase"] = rec.phase.value
-            first_fill = inventory_strategy_store.normalize_leg_fill(
-                dict(rec.metadata.get("first_leg") or {}),
-            )
-            second_fill = inventory_strategy_store.normalize_leg_fill(
-                dict(rec.metadata.get("second_leg") or {}),
-            )
-            worker.dashboard["first_leg_fill"] = first_fill
-            worker.dashboard["second_leg_fill"] = second_fill
 
     async def on_market_tick(self, worker: "MarketWorker") -> None:
         if shutdown_requested():

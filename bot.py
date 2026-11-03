@@ -4420,6 +4420,8 @@ class MarketWorker:
             "accumulation_phase": self.dashboard.get("accumulation_phase", ""),
             "first_leg_fill": dict(self.dashboard.get("first_leg_fill") or {}),
             "second_leg_fill": dict(self.dashboard.get("second_leg_fill") or {}),
+            "hedge_fills": dict(self.dashboard.get("hedge_fills") or self.dashboard.get("first_leg_fill") or {}),
+            "dca_fills": dict(self.dashboard.get("dca_fills") or self.dashboard.get("second_leg_fill") or {}),
             "matched_pairs": round(inv.matched_pairs, 4),
             "yes_shares": round(inv.yes_shares, 4),
             "no_shares": round(inv.no_shares, 4),

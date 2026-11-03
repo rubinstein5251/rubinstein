@@ -2311,15 +2311,21 @@ function _fmtLegFillSide(slot) {
   return `${qty.toFixed(1)} sh @ ${c.toFixed(1)}¢`;
 }
 
-function _renderPairLegBlock(label, rawFill) {
+function _renderPairLegBlock(label, subtitle, rawFill, rowKind) {
   const fill = _normalizeLegFill(rawFill);
-  const kind = fill && fill.kind === 'emergency_hedge'
-    ? ' <span class="text-yellow-500/90">emergency</span>'
-    : fill && (fill.kind === 'ideal_hedge' || fill.kind === 'initial_hedge_allowed')
-      ? ' <span class="text-sky-400/90">hedge</span>'
-      : '';
+  let kind = '';
+  if (rowKind === 'hedge' && fill) {
+    kind = fill.kind === 'emergency_hedge' || fill.kind === 'force_hedge_after_timeout'
+      ? ' <span class="text-yellow-500/90">emergency</span>'
+      : (fill.kind === 'ideal_hedge' ? ' <span class="text-sky-400/90">ideal</span>' : '');
+  } else if (rowKind === 'dca' && fill && fill.kind) {
+    kind = fill.kind === 'rebalance'
+      ? ' <span class="text-violet-400/90">rebalance</span>'
+      : ' <span class="text-emerald-400/90">avg down</span>';
+  }
   return `<div class="mb-2.5">
-    <div class="text-zinc-500 text-xs mb-1">${label}${kind}</div>
+    <div class="text-zinc-500 text-xs mb-0.5">${label}${kind}</div>
+    <div class="text-zinc-600 text-[10px] uppercase tracking-wide mb-1">${subtitle}</div>
     <div class="flex justify-between gap-2 text-xs py-0.5">
       <span class="text-accent font-medium">YES</span>
       <span class="font-mono text-zinc-100">${_fmtLegFillSide(fill && fill.YES)}</span>
@@ -2337,8 +2343,8 @@ function _renderInventoryDetailGrid(bot) {
   const reason = String(bot.inventory_action_reason || bot.entry_block_reason || '').trim();
   return `<div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-sm font-mono">
     <div class="text-xs text-zinc-500 uppercase tracking-wide mb-2">Pair entry fills</div>
-    ${_renderPairLegBlock('First leg fill', bot.first_leg_fill)}
-    ${_renderPairLegBlock('Second leg fill', bot.second_leg_fill)}
+    ${_renderPairLegBlock('First leg fill', 'Ideal / emergency hedge', bot.first_leg_fill || bot.hedge_fills, 'hedge')}
+    ${_renderPairLegBlock('Second leg fill', 'DCA price fills', bot.second_leg_fill || bot.dca_fills, 'dca')}
     <div class="text-xs text-zinc-500 uppercase tracking-wide mt-3 mb-2">Inventory legs (total)</div>
     ${_fmtLegSpend(bot, 'YES')}
     ${_fmtLegSpend(bot, 'NO')}
