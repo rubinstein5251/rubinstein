@@ -59,6 +59,24 @@ def executable_buy_from_asks(
     return cost / filled, filled
 
 
+def executable_sell_from_bids_at_min(
+    bids: Iterable,
+    size: float,
+    min_price: float,
+    *,
+    require_full_size: bool = True,
+) -> Optional[Tuple[float, float]]:
+    """Walk bids at or above min_price (FOK take-profit floor)."""
+    try:
+        floor = float(min_price)
+    except (TypeError, ValueError):
+        return None
+    filtered = [row for row in _levels(bids) if row[0] >= floor - 1e-9]
+    return executable_sell_from_bids(
+        filtered, size, require_full_size=require_full_size,
+    )
+
+
 def executable_sell_from_bids(
     bids: Iterable,
     size: float,

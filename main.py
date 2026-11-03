@@ -157,16 +157,18 @@ def _app_config_payload() -> dict:
         ],
         "market_interval":          "5m",
         "trading_assets_label":     trading_assets_label(),
-        "strategy":                 "directional_fok",
-        "strategy_label":           "95c+ Min Entry / Stop Loss",
+        "strategy":                 "momentum_directional",
+        "strategy_label":           "BTC/ETH Momentum",
     }
     if wc0 is not None:
         payload.update({
-            "minimum_entry_price_c": round(wc0.entry_price * 100, 2),
-            "entry_price_c": round(wc0.entry_price * 100, 2),
+            "max_entry_price_c": round(wc0.momentum_max_entry_price * 100, 2),
+            "min_net_edge_pct": round(wc0.min_net_edge * 100, 2),
             "stop_loss_pct": wc0.stop_loss_pct,
             "order_size": wc0.order_size_max,
             "execution_type": "FOK",
+            "dry_run": wc0.dry_run,
+            "live_trading_enabled": wc0.live_trading_enabled,
         })
     return payload
 
@@ -259,6 +261,11 @@ async def _initialize_bots():
             return
         account.start_pnl_merge_scheduler()
         print("✅ AccountService ready.")
+
+        from bot import ensure_binance_feeds_for_workers
+
+        await ensure_binance_feeds_for_workers()
+        print("✅ Binance external market feeds requested.")
 
         # ── Per-asset market workers ──────────────────────────────────────
         for wc in WORKER_CONFIGS:
@@ -469,18 +476,22 @@ def get_global_stats() -> dict:
             "biggest_win": round(_biggest_win_cache['value'], 2),
         }
 
-    total_pnl       = 0.0
     active_count    = 0
-    total_wins      = 0
-    total_losses    = 0
     in_profit_count = 0
     in_loss_count   = 0
 
+    from utils.accounting_definitions import portfolio_realized_and_overall
+    from utils.canonical_ledger import canonical_ledger
+
+    totals = portfolio_realized_and_overall(bots)
+    total_pnl = totals["overall_net_pnl"]
+    cumulative_realized = totals["cumulative_realized_pnl"]
+    total_unrealized = totals["unrealized_pnl"]
+    total_wins, total_losses = 0, 0
+    _, total_wins, total_losses, _ = canonical_ledger.portfolio_totals()
+
     for bot in bots:
         try:
-            total_pnl    += getattr(bot, "cumulative_pnl", 0.0)
-            total_wins   += getattr(bot, "wins",    0)
-            total_losses += getattr(bot, "losses",  0)
             in_position = (
                 getattr(bot, "inventory", None) is not None
                 and (
@@ -518,6 +529,9 @@ def get_global_stats() -> dict:
         "total_bots":           len(bots),
         "active_bots":          active_count,
         "total_pnl":            round(total_pnl, 2),
+        "overall_net_pnl":      round(total_pnl, 4),
+        "cumulative_realized_pnl": round(cumulative_realized, 4),
+        "unrealized_pnl":       round(total_unrealized, 4),
         "closed_trades":        closed_trades,
         "in_profit":            in_profit_count,
         "in_loss":              in_loss_count,
@@ -2179,6 +2193,24 @@ function _botCardPnlBorderClass(bot) {
   return '';
 }
 
+function _legAvgCents(bot, leg) {
+  const isYes = leg === 'YES';
+  const sh = Number(isYes ? bot.yes_shares : bot.no_shares) || 0;
+  if (sh <= 0) return 0;
+  let c = Number(isYes ? bot.yes_avg_price_c : bot.no_avg_price_c) || 0;
+  if (c <= 0) {
+    const p = Number(isYes ? bot.yes_avg_price : bot.no_avg_price) || 0;
+    if (p > 0) c = p <= 1 ? p * 100 : p;
+  }
+  if (c <= 0) {
+    const bought = String(bot.bought_side || bot.initial_entry_side || bot.position_side || '').toUpperCase();
+    if (bought === leg) {
+      c = Number(bot.entry_fill_price_c || bot.initial_entry_fill_c) || 0;
+    }
+  }
+  return c;
+}
+
 function _fmtPositionRow(bot) {
   const ySh = Number(bot.yes_shares) || 0;
   const nSh = Number(bot.no_shares) || 0;
@@ -2186,28 +2218,137 @@ function _fmtPositionRow(bot) {
     const side = String(bot.position_side || '').toUpperCase();
     const sz = Number(bot.position_size) || 0;
     if (side && sz > 0) {
-      const fillC = Number(bot.entry_fill_price_c) || 0;
-      const cost = sz * fillC / 100;
-      return `${side} @ $${_fmtMoney(cost)}`;
+      const fillC = Number(bot.entry_fill_price_c || bot.initial_entry_fill_c) || 0;
+      if (fillC > 0) return `${side} ${sz.toFixed(1)} sh @ ${fillC.toFixed(1)}c`;
+      return `${side} ${sz.toFixed(1)} sh`;
     }
     const pos = String(bot.position || '').trim();
     if (pos && pos !== '-') return pos;
     return '-';
   }
   const parts = [];
-  let yesCost = 0;
-  let noCost = 0;
   if (ySh > 0) {
-    yesCost = ySh * (Number(bot.yes_avg_price_c) || 0) / 100;
-    parts.push(`YES @ $${_fmtMoney(yesCost)}`);
+    const yC = _legAvgCents(bot, 'YES');
+    parts.push(yC > 0 ? `YES ${ySh.toFixed(1)} sh @ ${yC.toFixed(1)}c` : `YES ${ySh.toFixed(1)} sh`);
   }
   if (nSh > 0) {
-    noCost = nSh * (Number(bot.no_avg_price_c) || 0) / 100;
-    parts.push(`NO @ $${_fmtMoney(noCost)}`);
+    const nC = _legAvgCents(bot, 'NO');
+    parts.push(nC > 0 ? `NO ${nSh.toFixed(1)} sh @ ${nC.toFixed(1)}c` : `NO ${nSh.toFixed(1)} sh`);
   }
-  let text = parts.join(' ');
-  if (ySh > 0 && nSh > 0) text += ` (pair=$${(yesCost + noCost).toFixed(1)})`;
+  let text = parts.join(' · ');
+  if (ySh > 0 && nSh > 0) {
+    const pairC = Number(bot.pair_avg_price_c) || (_legAvgCents(bot, 'YES') + _legAvgCents(bot, 'NO'));
+    if (pairC > 0) text += ` (pair ${pairC.toFixed(1)}c)`;
+  }
   return text;
+}
+
+function _isInventoryAccumulation(bot) {
+  return !!bot.inventory_accumulation_enabled;
+}
+
+function _fmtLegSpend(bot, leg) {
+  const isYes = leg === 'YES';
+  const sh = Number(isYes ? bot.yes_shares : bot.no_shares) || 0;
+  const spent = Number(isYes ? bot.yes_spent_usd : bot.no_spent_usd) || 0;
+  const avgC = _legAvgCents(bot, leg);
+  const label = isYes ? 'YES (UP)' : 'NO (DOWN)';
+  if (sh <= 0) {
+    return `<div class="flex items-center justify-between gap-2 py-1">
+      <span class="text-zinc-400">${label}</span>
+      <span class="font-mono text-zinc-500">—</span>
+    </div>`;
+  }
+  const avgTxt = avgC > 0 ? `@ ${avgC.toFixed(1)}¢` : '';
+  return `<div class="flex items-center justify-between gap-2 py-1">
+    <span class="text-zinc-400">${label}</span>
+    <span class="font-mono text-zinc-100 text-right">${sh.toFixed(1)} sh ${avgTxt}<br><span class="text-zinc-400 text-xs">${_fmtUsd(spent)} spent</span></span>
+  </div>`;
+}
+
+function _fmtUsdCompact(v) {
+  const n = Number(v) || 0;
+  return '$' + n.toFixed(2);
+}
+
+function _renderInventoryStatusBar(bot) {
+  const targetC = Number(bot.target_combined_pair_cost_c) || 98;
+  const combinedC = Number(bot.matched_combined_cost_c || bot.pair_avg_price_c) || 0;
+  const phase = String(bot.accumulation_phase || bot.strategy_state || '—').replace(/_/g, ' ');
+  const next = String(bot.inventory_next_action || '—').replace(/_/g, ' ');
+  const combinedCls = combinedC > 0 && combinedC <= targetC + 0.5 ? 'text-accent' : combinedC > targetC ? 'text-yellow-400' : 'text-zinc-300';
+  return `<div class="text-xs text-zinc-400 font-mono flex flex-wrap gap-x-3 gap-y-1">
+    <span>Target pair <span class="text-orange-400">${targetC.toFixed(0)}¢</span></span>
+    <span>Combined <span class="${combinedCls}">${combinedC > 0 ? combinedC.toFixed(1) + '¢' : '—'}</span></span>
+    <span>Phase <span class="text-zinc-200">${phase}</span></span>
+    <span>Next <span class="text-sky-300">${next}</span></span>
+  </div>`;
+}
+
+function _normalizeLegFill(fill) {
+  if (!fill || typeof fill !== 'object') return null;
+  if (fill.YES || fill.NO) return fill;
+  const side = String(fill.side || '').toUpperCase();
+  if (!side) return null;
+  const qty = Number(fill.qty) || 0;
+  let c = Number(fill.price_c) || 0;
+  if (c <= 0 && fill.price) c = Number(fill.price) * 100;
+  const out = {
+    YES: { qty: 0, price_c: 0 },
+    NO: { qty: 0, price_c: 0 },
+    kind: fill.kind || '',
+  };
+  out[side] = { qty, price_c: c };
+  return out;
+}
+
+function _fmtLegFillSide(slot) {
+  if (!slot) return '—';
+  const qty = Number(slot.qty) || 0;
+  if (qty <= 0) return '—';
+  let c = Number(slot.price_c) || 0;
+  if (c <= 0 && slot.price) c = Number(slot.price) * 100;
+  return `${qty.toFixed(1)} sh @ ${c.toFixed(1)}¢`;
+}
+
+function _renderPairLegBlock(label, rawFill) {
+  const fill = _normalizeLegFill(rawFill);
+  const kind = fill && fill.kind === 'emergency_hedge'
+    ? ' <span class="text-yellow-500/90">emergency</span>'
+    : fill && (fill.kind === 'ideal_hedge' || fill.kind === 'initial_hedge_allowed')
+      ? ' <span class="text-sky-400/90">hedge</span>'
+      : '';
+  return `<div class="mb-2.5">
+    <div class="text-zinc-500 text-xs mb-1">${label}${kind}</div>
+    <div class="flex justify-between gap-2 text-xs py-0.5">
+      <span class="text-accent font-medium">YES</span>
+      <span class="font-mono text-zinc-100">${_fmtLegFillSide(fill && fill.YES)}</span>
+    </div>
+    <div class="flex justify-between gap-2 text-xs py-0.5">
+      <span class="text-red-400 font-medium">NO</span>
+      <span class="font-mono text-zinc-100">${_fmtLegFillSide(fill && fill.NO)}</span>
+    </div>
+  </div>`;
+}
+
+function _renderInventoryDetailGrid(bot) {
+  const total = Number(bot.total_invested_usd || bot.invested) || 0;
+  const matched = Number(bot.matched_pairs) || 0;
+  const reason = String(bot.inventory_action_reason || bot.entry_block_reason || '').trim();
+  return `<div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-sm font-mono">
+    <div class="text-xs text-zinc-500 uppercase tracking-wide mb-2">Pair entry fills</div>
+    ${_renderPairLegBlock('First leg fill', bot.first_leg_fill)}
+    ${_renderPairLegBlock('Second leg fill', bot.second_leg_fill)}
+    <div class="text-xs text-zinc-500 uppercase tracking-wide mt-3 mb-2">Inventory legs (total)</div>
+    ${_fmtLegSpend(bot, 'YES')}
+    ${_fmtLegSpend(bot, 'NO')}
+    <div class="border-t border-zinc-700/80 mt-2 pt-2 space-y-1 text-xs">
+      <div class="flex justify-between"><span class="text-zinc-400">Combined pair cost</span><span class="text-zinc-100">${Number(bot.matched_combined_cost_c || bot.pair_avg_price_c) > 0 ? Number(bot.matched_combined_cost_c || bot.pair_avg_price_c).toFixed(1) + '¢' : '—'}</span></div>
+      <div class="flex justify-between"><span class="text-zinc-400">Total spent</span><span class="text-zinc-100">${_fmtUsdCompact(total)}</span></div>
+      <div class="flex justify-between"><span class="text-zinc-400">Matched pairs</span><span class="text-zinc-100">${matched > 0 ? matched.toFixed(1) : '—'}</span></div>
+      ${reason ? `<div class="col-span-2 text-zinc-500 pt-1">${reason}</div>` : ''}
+    </div>
+  </div>`;
 }
 
 function renderCard(bot){
@@ -2218,11 +2359,30 @@ function renderCard(bot){
   const cumPos=(bot.cumulative_pnl||0)>=0;
   const inProfit=hasInv&&(bot.pnl_dollars||0)>0;
   const inLoss=hasInv&&(bot.pnl_dollars||0)<0;
-  const stratLabel=bot.strategy_name||bot.strategy_label||'95c Entry / Stop Loss';
-  const entryC=Number(bot.minimum_entry_price_c||bot.configured_entry_price_c||95);
+  const stratLabel=bot.strategy_name||bot.strategy_label||'BTC/ETH Momentum';
+  const entryC=Number(bot.max_entry_price_c||bot.minimum_entry_price_c||92);
+  const minEdge=Number(bot.min_net_edge_pct||5);
+  const momDir=String(bot.momentum_direction||'—');
+  const momSignal=String(bot.momentum_signal_display||'—');
+  const yesEdge=Number(bot.yes_net_edge||0);
+  const noEdge=Number(bot.no_net_edge||0);
   const limitC=Number(bot.buy_limit_price_c||0);
-  const stopPct=Number(bot.stop_loss_pct||0.35);
+  const stopPct=Number(bot.stop_loss_pct||0.20);
+  const tpPct=Number(bot.take_profit_pct||0.10);
   const stopTrigC=Number(bot.stop_loss_trigger_c||0);
+  const tpTrigC=Number(bot.take_profit_trigger_c||0);
+  const stopStatus=String(bot.stop_loss_status||'Monitoring');
+  const initSide=String(bot.initial_entry_side||bot.position_side||'').toUpperCase();
+  const initFillC=Number(bot.initial_entry_fill_c||bot.entry_fill_price_c||0);
+  const initQty=Number(bot.initial_entry_quantity||bot.filled_size||0);
+  const sigScore=Number(bot.signal_quality_score||0);
+  const sigThreshold=Number(bot.signal_quality_threshold||60);
+  const netEdge=Number(bot.entry_net_edge||0);
+  const tpExits=Number(bot.take_profit_exits||0);
+  const slExits=Number(bot.stop_loss_exits||0);
+  const totalFees=Number(bot.fees_paid||0);
+  const exitFillC=Number(bot.exit_fill_price_c||0);
+  const exitReason=String(bot.exit_reason||'');
   const displayState=String(bot.strategy_display_state||bot.status||'WAITING FOR ENTRY');
   const posSide=String(bot.position_side||'').toUpperCase();
   const entryFillC=Number(bot.entry_fill_price_c||0);
@@ -2230,9 +2390,6 @@ function renderCard(bot){
   const stoppedOut=!!bot.market_stopped_out;
   const entryOrd=String(bot.entry_order_status||'IDLE');
   const exitOrd=String(bot.exit_order_status||'IDLE');
-  const execType=bot.execution_type||'FOK';
-  const orderSz=Number(bot.order_size||0);
-  const marketId=(bot.market_id||'').slice(0,12);
   let signal=displayState;
   if(stoppedOut&&!hasPos) signal='MARKET BLOCKED AFTER STOP LOSS';
   const yesAskC=Number(bot.yes_ask_c||bot.yes||0);
@@ -2248,10 +2405,50 @@ function renderCard(bot){
       :hasPos
         ?`<span class="text-xs bg-sky-900 text-sky-300 px-2 py-0.5 rounded-full">⚡ IN POSITION</span>`
         :`<span class="text-xs bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded-full">WAITING</span>`;
-  const blockedBanner=stoppedOut?`
+  const invMode = _isInventoryAccumulation(bot);
+  const blockedBanner=!invMode&&stoppedOut?`
       <div class="bg-red-950/40 border border-red-900/60 rounded-xl px-3 py-2 mb-3 text-xs text-red-300">
         <div class="font-semibold">Market blocked after stop loss — no re-entry</div>
       </div>`:'';
+  const statusBarInner = invMode
+    ? _renderInventoryStatusBar(bot)
+    : `<span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
+          ${sigIcon(signal)} ${signal}
+        </span>
+        <div class="text-xs text-zinc-400 font-mono">
+          edge ≥ <span class="text-orange-400">${minEdge.toFixed(1)}pp</span>
+          &nbsp;· max <span class="text-orange-400">${entryC.toFixed(1)}¢</span>
+          &nbsp;· ${momDir}
+          &nbsp;· TP <span class="text-accent">+${(tpPct*100).toFixed(0)}%</span>
+          &nbsp;· stop <span class="text-red-400">-${(stopPct*100).toFixed(0)}%</span>
+        </div>`;
+  const detailGrid = invMode
+    ? _renderInventoryDetailGrid(bot)
+    : `<div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
+        <span class="col-span-2">${stratLabel} · ${displayState}${bot.entry_block_reason?(' · '+bot.entry_block_reason):''}</span>
+        <span>Momentum: ${momDir} · ${momSignal}</span>
+        <span>Signal quality: ${sigScore?sigScore.toFixed(0)+'/'+sigThreshold:'—'} · net edge ${(netEdge*100).toFixed(1)}pp</span>
+        <span>Position: ${posSide||initSide||'—'} ${initQty?initQty.toFixed(1)+' sh @ '+initFillC.toFixed(1)+'c':'—'}</span>
+        <span>Take-profit: +${(tpPct*100).toFixed(0)}% @ ${tpTrigC?tpTrigC.toFixed(1)+'c':'—'}</span>
+        <span>Stop-loss: -${(stopPct*100).toFixed(0)}% @ ${stopTrigC?stopTrigC.toFixed(1)+'c':'—'} · ${stopStatus}</span>
+        <span>YES ask: ${yesAskC?yesAskC.toFixed(1)+'c':'—'}</span>
+        <span>NO ask: ${noAskC?noAskC.toFixed(1)+'c':'—'}</span>
+        <span>Max entry: ${entryC.toFixed(1)}c</span>
+        <span>YES edge: ${(yesEdge*100).toFixed(1)}pp</span>
+        <span>NO edge: ${(noEdge*100).toFixed(1)}pp</span>
+        <span>Buy limit: ${limitC?limitC.toFixed(1)+'c':'—'}</span>
+        <span>Bid: ${bidC?bidC.toFixed(1)+'c':'—'}</span>
+        <span>TP @: ${tpTrigC?tpTrigC.toFixed(1)+'c':'—'}</span>
+        <span>Stop @: ${stopTrigC?stopTrigC.toFixed(1)+'c':'—'}</span>
+        <span>Exit fill: ${exitFillC?exitFillC.toFixed(1)+'c':'—'} · ${exitReason||'—'}</span>
+        <span>TP exits: ${tpExits} · SL exits: ${slExits}</span>
+        <span>Fees: $${totalFees.toFixed(2)}</span>
+        <span>Entry ord: ${entryOrd}</span>
+        <span>Exit ord: ${exitOrd}</span>
+      </div>`;
+  const statusBarWrapClass = invMode
+    ? 'bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex flex-col gap-1'
+    : 'bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap';
   return`
     <div class="rounded-2xl">
       <div class="flex items-center justify-between mb-1">
@@ -2273,52 +2470,38 @@ function renderCard(bot){
           <div class="text-lg font-bold text-red-400 font-mono" style="font-variant-numeric:tabular-nums;">${_displayYesNoPrice(bot.no||0)}</div>
         </div>
       </div>
-      <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
-        <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
-          ${sigIcon(signal)} ${signal}
-        </span>
-        <div class="text-xs text-zinc-400 font-mono">
-          ask ≥ <span class="text-orange-400">${entryC.toFixed(1)}¢</span>
-          &nbsp;· stop <span class="text-red-400">${(stopPct*100).toFixed(0)}%</span>
-        </div>
+      <div class="${statusBarWrapClass}">
+        ${invMode ? `<div class="text-xs font-semibold text-zinc-300">${stratLabel}</div>` : ''}
+        ${statusBarInner}
       </div>
-      <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
-        <span class="col-span-2">${stratLabel} · ${displayState}${bot.entry_block_reason?(' · '+bot.entry_block_reason):''}</span>
-        <span>Market: ${marketId||'—'}…</span>
-        <span>Exec: ${execType} · ${orderSz?orderSz.toFixed(0)+' sh':'—'}</span>
-        <span>YES ask: ${yesAskC?yesAskC.toFixed(1)+'c':'—'}</span>
-        <span>NO ask: ${noAskC?noAskC.toFixed(1)+'c':'—'}</span>
-        <span>Min entry: ${entryC.toFixed(1)}c</span>
-        <span>Buy limit: ${limitC?limitC.toFixed(1)+'c':'—'}</span>
-        <span>Side: ${posSide||'—'}</span>
-        <span>Size: ${Number(bot.position_size||0).toFixed(1)} sh</span>
-        <span>Fill price: ${entryFillC?entryFillC.toFixed(1)+'c':'—'}</span>
-        <span>Bid: ${bidC?bidC.toFixed(1)+'c':'—'}</span>
-        <span>Stop @: ${stopTrigC?stopTrigC.toFixed(1)+'c':'—'}</span>
-        <span>Entry ord: ${entryOrd}</span>
-        <span>Exit ord: ${exitOrd}</span>
-      </div>
+      ${detailGrid}
       <div class="space-y-1.5 text-sm mb-3">
-        <div class="flex items-center justify-between">
+        ${invMode ? '' : `<div class="flex items-center justify-between">
           <span class="text-zinc-400">Position</span>
           <span class="font-mono text-zinc-200">${positionRow}</span>
-        </div>
+        </div>`}
         <div class="flex items-center justify-between">
-          <span class="text-zinc-400">Unrealized (open)</span>
+          <span class="text-zinc-400">Unrealized P&amp;L</span>
           <span class="font-mono ${pnlPos?'text-accent':'text-red-400'}" style="font-variant-numeric:tabular-nums;">
-            ${_displayTradePnl(bot.pnl_dollars, bot.pnl_pct)}
+            ${_displayTradePnl(bot.unrealized_pnl ?? bot.pnl_dollars, bot.pnl_pct)}
           </span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-zinc-400">Realized (settled)</span>
+          <span class="text-zinc-400">Realized P&amp;L</span>
           <span class="font-mono text-zinc-300" style="font-variant-numeric:tabular-nums;">
-            ${_displayCumulativePnl(bot.realized_pnl ?? bot.cumulative_pnl)}
+            ${_displayCumulativePnl(bot.realized_pnl ?? bot.cumulative_realized_pnl)}
           </span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-zinc-400">Cumulative PnL</span>
-          <span class="font-mono font-semibold ${cumPos?'text-accent':'text-red-300'}" style="font-variant-numeric:tabular-nums;">
-            ${_displayCumulativePnl(bot.cumulative_pnl)}
+          <span class="text-zinc-400">Cumulative realized</span>
+          <span class="font-mono text-zinc-300" style="font-variant-numeric:tabular-nums;">
+            ${_displayCumulativePnl(bot.cumulative_realized_pnl ?? bot.cumulative_pnl)}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-zinc-400">Overall net P&amp;L</span>
+          <span class="font-mono font-semibold ${(Number(bot.overall_net_pnl||bot.total_net_pnl||0)>=0)?'text-accent':'text-red-300'}" style="font-variant-numeric:tabular-nums;">
+            ${_displayCumulativePnl(bot.overall_net_pnl ?? bot.total_net_pnl)}
           </span>
         </div>
         <div class="flex items-center justify-between">

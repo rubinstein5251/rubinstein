@@ -216,6 +216,78 @@ class InventoryStrategyStore:
         self.upsert(rec)
         return rec
 
+    @staticmethod
+    def _empty_leg_legs() -> dict:
+        return {
+            "YES": {"qty": 0.0, "price": 0.0, "price_c": 0.0},
+            "NO": {"qty": 0.0, "price": 0.0, "price_c": 0.0},
+        }
+
+    @staticmethod
+    def normalize_leg_fill(raw: dict) -> dict:
+        """Dashboard/API shape: both YES and NO slots per leg event."""
+        if not raw:
+            return {**InventoryStrategyStore._empty_leg_legs(), "kind": "", "ts": 0.0}
+        if "YES" in raw or "NO" in raw:
+            yes = dict(raw.get("YES") or {})
+            no = dict(raw.get("NO") or {})
+            return {
+                "YES": {
+                    "qty": float(yes.get("qty") or 0),
+                    "price": float(yes.get("price") or 0),
+                    "price_c": float(yes.get("price_c") or 0),
+                },
+                "NO": {
+                    "qty": float(no.get("qty") or 0),
+                    "price": float(no.get("price") or 0),
+                    "price_c": float(no.get("price_c") or 0),
+                },
+                "kind": str(raw.get("kind") or ""),
+                "ts": float(raw.get("ts") or 0),
+            }
+        side = str(raw.get("side") or "").upper()
+        legs = InventoryStrategyStore._empty_leg_legs()
+        if side in legs:
+            px = float(raw.get("price") or 0)
+            legs[side] = {
+                "qty": float(raw.get("qty") or 0),
+                "price": px,
+                "price_c": float(raw.get("price_c") or round(px * 100.0, 2)),
+            }
+        return {
+            **legs,
+            "kind": str(raw.get("kind") or ""),
+            "ts": float(raw.get("ts") or 0),
+        }
+
+    def record_cycle_leg_fill(
+        self,
+        rec: MarketCycleRecord,
+        *,
+        leg: str,
+        side: str,
+        qty: float,
+        price: float,
+        kind: str = "",
+    ) -> None:
+        key = "first_leg" if leg == "first" else "second_leg"
+        rec.metadata.setdefault("entries", {})
+        side_u = str(side).upper()
+        px = float(price)
+        legs = self._empty_leg_legs()
+        if side_u in legs:
+            legs[side_u] = {
+                "qty": float(qty),
+                "price": px,
+                "price_c": round(px * 100.0, 2),
+            }
+        rec.metadata[key] = {
+            **legs,
+            "ts": time.time(),
+            "kind": kind or key,
+        }
+        self.upsert(rec)
+
     def start_cycle(
         self,
         worker_key: str,
@@ -223,6 +295,7 @@ class InventoryStrategyStore:
         *,
         first_leg_side: str,
         hedge_delay_seconds: float = 0.0,
+        hedge_timeout_seconds: float = 4.0,
     ) -> MarketCycleRecord:
         """Begin opposite-side wait after confirmed first-leg fill."""
         now = time.time()
@@ -231,7 +304,7 @@ class InventoryStrategyStore:
             rec = self.get_or_create_cycle(worker_key, condition_id)
         rec.first_leg_side = first_leg_side
         rec.first_fill_at = now
-        rec.hedge_deadline_at = now
+        rec.hedge_deadline_at = now + max(0.0, float(hedge_delay_seconds)) + max(0.0, float(hedge_timeout_seconds))
         rec.phase = AccumulationPhase.WAITING_FOR_OPPOSITE_ENTRY
         rec.initial_hedge_complete = False
         rec.metadata.setdefault("entries", {})

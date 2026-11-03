@@ -44,6 +44,15 @@ async def fok_buy_limit(
             raise ValueError(
                 f"buy limit {limit:.4f} below minimum entry {minimum:.4f}"
             )
+    if purpose == "momentum_entry":
+        maximum = worker.resolved_momentum_max_entry().minimum_price
+        if limit > maximum + 1e-9:
+            raise ValueError(
+                f"buy limit {limit:.4f} above max entry {maximum:.4f}"
+            )
+    if purpose in ("pair_accumulation", "initial_hedge", "emergency_hedge", "inventory_rebalance", "inventory_dca"):
+        if limit <= 0 or limit > 1.0:
+            raise ValueError(f"invalid inventory buy limit {limit:.4f} ({purpose})")
     if worker.is_dry_run():
         qty, px = await _simulate_fok_buy(worker, side, limit, size)
         return qty, px, "dry-run" if qty > MIN_FILL_DELTA else None
@@ -83,16 +92,39 @@ async def fok_buy_limit(
     return 0.0, 0.0, order_id
 
 
-async def _simulate_fok_sell(worker: "MarketWorker", side: str, limit: float, size: float):
+async def _simulate_fok_sell(
+    worker: "MarketWorker",
+    side: str,
+    limit: float,
+    size: float,
+    *,
+    purpose: str,
+):
     from bot import MIN_FILL_DELTA
+    from utils.order_book_math import executable_sell_from_bids_at_min
 
     cfg = worker.worker_config
     timeout_sec = max(0.0, cfg.fill_timeout_ms / 1000.0)
     poll_sec = max(0.05, cfg.fill_poll_ms / 1000.0)
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() <= deadline:
+        worker.refresh_order_book(side)
+        cached = worker._book_cache.get(side)
+        exe = None
+        if cached:
+            book = cached[1]
+            bids = book.get("bids") if isinstance(book, dict) else getattr(book, "bids", None)
+            if purpose == "take_profit":
+                exe = executable_sell_from_bids_at_min(
+                    bids, size, limit, require_full_size=True,
+                )
+            else:
+                from utils.order_book_math import executable_sell_from_bids
+                exe = executable_sell_from_bids(bids, size, require_full_size=True)
+        if exe and exe[0] >= limit - 1e-9 and exe[1] >= size - MIN_FILL_DELTA:
+            return exe[1], exe[0]
         bid = float(worker.best_bid(side))
-        if bid >= limit - 1e-9:
+        if purpose != "take_profit" and bid >= limit - 1e-9:
             qty = min(size, worker.inventory.shares(side))
             if qty >= size - MIN_FILL_DELTA:
                 return qty, bid
@@ -112,14 +144,16 @@ async def fok_sell_limit(
 
     limit = clamp_sell_price(limit_price)
     if worker.is_dry_run():
-        qty, px = await _simulate_fok_sell(worker, side, limit, size)
-        return qty, px, "dry-run" if qty > MIN_FILL_DELTA else None
+        qty, px = await _simulate_fok_sell(worker, side, limit, size, purpose=purpose)
+        if qty > MIN_FILL_DELTA and px >= limit - 1e-9:
+            return qty, px, "dry-run"
+        return 0.0, 0.0, None
 
     fill_size, fill_px = await worker.place_exit_sell(
-        side, limit, size, stop_loss_only=True,
+        side, limit, size, exit_purpose=purpose,
     )
-    if fill_size > MIN_FILL_DELTA:
-        return fill_size, fill_px, "stop-loss"
+    if fill_size > MIN_FILL_DELTA and fill_px >= limit - 1e-9:
+        return fill_size, fill_px, purpose
     return 0.0, 0.0, None
 
 

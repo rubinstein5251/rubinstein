@@ -129,6 +129,21 @@ def _project_after_buy(eff: EffectiveInventory, side: str, qty: float) -> Tuple[
     return y, n
 
 
+def max_qty_within_side_cap(
+    eff: EffectiveInventory,
+    side: str,
+    qty: float,
+    max_shares_per_side: float,
+) -> float:
+    """Clamp ``qty`` so confirmed + pending on ``side`` does not exceed per-leg cap."""
+    if qty <= 0 or max_shares_per_side <= _EPS:
+        return 0.0
+    side = side.upper()
+    held = eff.effective_yes if side == "YES" else eff.effective_no
+    headroom = max(0.0, float(max_shares_per_side) - held)
+    return min(qty, headroom)
+
+
 def max_qty_without_increasing_imbalance(eff: EffectiveInventory, side: str, cap: float) -> float:
     """Max qty on ``side`` that does not increase effective share imbalance."""
     side = side.upper()
@@ -187,6 +202,7 @@ def plan_single_leg_buy(
     allow_unmatched_accumulation: bool,
     purpose: str,
     allow_first_leg_entry: bool = False,
+    max_shares_per_side: float = 0.0,
 ) -> BuySizePlan:
     """Central sizing + balance gate for one-sided BUY proposals."""
     side = side.upper()
@@ -194,7 +210,7 @@ def plan_single_leg_buy(
     current_combined = matched_combined_average(snap)
 
     # Hedge matches confirmed fills; pending hedge orders must not look "already balanced".
-    if purpose == "initial_hedge":
+    if purpose in ("initial_hedge", "emergency_hedge"):
         eff = EffectiveInventory(
             yes_confirmed=eff.yes_confirmed,
             no_confirmed=eff.no_confirmed,
@@ -249,10 +265,10 @@ def plan_single_leg_buy(
             )
         return _finish(approved, BuyApproval.APPROVED, "first_leg_approved")
 
-    if balance_inventory_before_buy:
+    if balance_inventory_before_buy and purpose != "dca_average_down":
         if allow_first_leg_entry and purpose in ("cheap_entry", "first_leg"):
             pass
-        elif purpose == "initial_hedge":
+        elif purpose in ("initial_hedge", "emergency_hedge"):
             hedge_side = under
             if hedge_side and side != hedge_side:
                 return _finish(
@@ -293,11 +309,11 @@ def plan_single_leg_buy(
                     "SKIP BUY: would exceed maximum YES/NO share imbalance",
                 )
 
-    if purpose == "initial_hedge":
+    if purpose in ("initial_hedge", "emergency_hedge"):
         gap = abs(eff.yes_confirmed - eff.no_confirmed)
         approved = min(approved, gap)
         approved = normalize_share_qty(approved, min_order_size=min_order_size)
-    elif balance_inventory_before_buy:
+    elif balance_inventory_before_buy and purpose not in ("dca_average_down", "dca_rebalance"):
         imb_cap = max_share_imbalance
         under_now = underrepresented_side(eff)
         if (
@@ -309,7 +325,21 @@ def plan_single_leg_buy(
         approved = max_qty_within_imbalance_limit(eff, side, approved, imb_cap)
         approved = normalize_share_qty(approved, min_order_size=min_order_size)
 
-    if not allow_unmatched_accumulation and purpose not in ("cheap_entry", "first_leg", "initial_hedge"):
+    if max_shares_per_side > _EPS:
+        approved = max_qty_within_side_cap(eff, side, approved, max_shares_per_side)
+        approved = normalize_share_qty(approved, min_order_size=min_order_size)
+        if approved < min_order_size - _QTY_SNAP:
+            held = eff.effective_yes if side == "YES" else eff.effective_no
+            return _finish(
+                0.0,
+                BuyApproval.REJECTED,
+                f"SKIP BUY: {side} at {held:.2f} shares — no headroom under max_shares_per_side "
+                f"{max_shares_per_side:.2f}",
+            )
+
+    if not allow_unmatched_accumulation and purpose not in (
+        "cheap_entry", "first_leg", "initial_hedge", "emergency_hedge", "dca_average_down", "dca_rebalance",
+    ):
         py_c, pn_c = eff.yes_confirmed, eff.no_confirmed
         proj_y, proj_n = _project_after_buy(eff, side, approved)
         proj_unmatched = max(abs(proj_y - proj_n), max(0.0, proj_y - proj_n), max(0.0, proj_n - proj_y))
@@ -334,7 +364,9 @@ def plan_single_leg_buy(
 
     py, pn = _project_after_buy(eff, side, approved)
     after_imb = abs(py - pn)
-    if balance_inventory_before_buy and purpose not in ("cheap_entry", "first_leg", "initial_hedge"):
+    if balance_inventory_before_buy and purpose not in (
+        "cheap_entry", "first_leg", "initial_hedge", "emergency_hedge", "dca_average_down",
+    ):
         under = underrepresented_side(eff)
         if after_imb > before_imb + _EPS and (under is None or side != under):
             return _finish(

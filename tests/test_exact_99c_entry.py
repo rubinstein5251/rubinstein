@@ -7,7 +7,8 @@ class ConfigurableEntryTests(unittest.TestCase):
         from config import load_worker_configs
 
         wc = load_worker_configs()[0]
-        self.assertAlmostEqual(wc.entry_price, 0.95)
+        self.assertAlmostEqual(wc.momentum_max_entry_price, 0.92)
+        self.assertGreater(wc.min_net_edge, 0)
 
     def test_polymarket_tick_drives_strategy(self):
         source = Path("bot.py").read_text(encoding="utf-8")

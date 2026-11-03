@@ -1,15 +1,29 @@
-"""Legacy sequential-pair tests removed — strategy is directional FOK only."""
+"""Inventory pair accumulation strategy wiring."""
+
+from __future__ import annotations
 
 import unittest
 from pathlib import Path
 
 
-class LegacyStrategyRemovedTests(unittest.TestCase):
-    def test_no_opposite_leg_in_strategy_module(self):
+class InventoryPairStrategyTests(unittest.TestCase):
+    def test_inventory_strategy_class_is_not_momentum_alias(self):
+        from strategies.inventory_accumulation_strategy import (
+            InventoryAccumulationStrategy,
+            MomentumDelayedAdjustmentStrategy,
+        )
+        from strategies.inventory_pair_accumulation import InventoryPairAccumulationStrategy
+
+        self.assertIs(InventoryAccumulationStrategy, InventoryPairAccumulationStrategy)
+        self.assertIsNot(InventoryAccumulationStrategy, MomentumDelayedAdjustmentStrategy)
+
+    def test_engine_module_present(self):
+        self.assertTrue(Path("utils/dynamic_arbitrage_engine.py").is_file())
+
+    def test_momentum_module_still_directional(self):
         src = Path("strategies/inventory_accumulation_strategy.py").read_text(encoding="utf-8")
+        self.assertIn("class MomentumDelayedAdjustmentStrategy", src)
         self.assertNotIn("_try_opposite_entry", src)
-        self.assertNotIn("initial_hedge", src)
-        self.assertNotIn("paired_dca", src)
 
 
 if __name__ == "__main__":

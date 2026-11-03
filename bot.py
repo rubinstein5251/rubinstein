@@ -46,7 +46,7 @@ from config import (
     worker_key,
 )
 from strategies.base import MomentumDecision
-from strategies.momentum import MomentumStrategy
+from strategies.momentum import InventoryAccumulationStrategy, MomentumStrategy
 from utils.order_book_math import (
     executable_buy_from_asks,
     executable_sell_from_bids,
@@ -62,6 +62,8 @@ from utils.inventory_balance import (
 )
 from strategies.arbigab_engines import ArbigabEngineRouter, economic_position
 from utils.momentum_inventory import PositionInventory
+from utils.canonical_ledger import canonical_ledger
+from utils.inventory_cost import InventorySnapshot, matched_combined_average
 from utils.momentum_risk import (
     entry_window_ok,
     is_order_fully_filled,
@@ -91,6 +93,31 @@ def exec_log(event: str, **kwargs):
 
 DRY_MODE = DRY_RUN_DEFAULT
 LOG_FILE  = "emiliano_trades.txt"
+
+
+def _atomic_write_json_file(file_path: str, data: dict) -> None:
+    """Write JSON atomically; retry replace on Windows when the target is locked."""
+    temp_file = file_path + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    last_err: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            os.replace(temp_file, file_path)
+            return
+        except (PermissionError, OSError) as exc:
+            last_err = exc
+            t.sleep(0.05 * (attempt + 1))
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    with contextlib.suppress(OSError):
+        os.remove(temp_file)
+    if last_err and not os.path.isfile(file_path):
+        raise last_err
 
 
 def live_on_chain_setup_required() -> bool:
@@ -1893,7 +1920,7 @@ class BinanceDepthSignal:
         self.momentum    = 0.0
         self.last_update = 0.0
         self._history: deque = deque(maxlen=8)
-        self._price_history: deque = deque(maxlen=128)
+        self._price_history: deque = deque(maxlen=4000)
         self.last_trade_price = 0.0
         self.last_trade_time = 0.0
         self.price_delta = 0.0
@@ -1901,7 +1928,11 @@ class BinanceDepthSignal:
 
     @property
     def is_fresh(self) -> bool:
-        return (t.time() - self.last_update) < BINANCE_STALE_CUTOFF_SECS
+        now = t.time()
+        last = max(float(self.last_update or 0), float(self.last_trade_time or 0))
+        if last <= 0:
+            return False
+        return (now - last) < BINANCE_STALE_CUTOFF_SECS
 
     @property
     def is_primed(self) -> bool:
@@ -1949,13 +1980,20 @@ class BinanceDepthSignal:
                                 now = t.time()
                                 self.last_trade_price = px
                                 self.last_trade_time = now
+                                self.last_update = now
                                 self._price_history.append((now, px))
-                                lookback = max(0.10, float(os.getenv("BINANCE_MOMENTUM_LOOKBACK", "1.0")))
-                                cutoff = now - lookback
-                                while self._price_history and self._price_history[0][0] < cutoff:
+                                retention = max(
+                                    130.0,
+                                    float(os.getenv("BINANCE_PRICE_HISTORY_SEC", "150")),
+                                )
+                                hist_cutoff = now - retention
+                                while self._price_history and self._price_history[0][0] < hist_cutoff:
                                     self._price_history.popleft()
-                                if self._price_history:
-                                    base = self._price_history[0][1]
+                                lookback = max(0.10, float(os.getenv("BINANCE_MOMENTUM_LOOKBACK", "1.0")))
+                                lb_cutoff = now - lookback
+                                lb_samples = [(ts, p) for ts, p in self._price_history if ts >= lb_cutoff]
+                                if lb_samples:
+                                    base = lb_samples[0][1]
                                     self.price_delta = (px - base) / base if base else 0.0
                                 # Event-driven wakeup: the strategy router can react to
                                 # Binance aggTrade without waiting for a Polymarket tick.
@@ -2481,6 +2519,19 @@ class MarketWorker:
         self.cumulative_pnl: float = _saved["total_pnl"]
         self.wins: int             = _saved["wins"]
         self.losses: int           = _saved["losses"]
+        self._logged_exit_order_ids: set[str] = set()
+        canonical_ledger.hydrate_worker_from_saved_stats(
+            self.worker_config.key,
+            total_pnl=self.cumulative_pnl,
+            wins=self.wins,
+            losses=self.losses,
+        )
+        _ledger = canonical_ledger.worker_summary(self.worker_config.key)
+        if abs(_ledger.realized_pnl) > 1e-9:
+            self.cumulative_pnl = round(_ledger.realized_pnl, 4)
+            self.wins = _ledger.wins
+            self.losses = _ledger.losses
+        self.trade_count = self.wins + self.losses
 
         self.trade_state: TradeState = TradeState.IDLE
         self.position_side: Optional[str] = None
@@ -2581,7 +2632,11 @@ class MarketWorker:
 
         self._locked_skip_logged: bool = False
 
-        self.strategy = MomentumStrategy()
+        wc = worker_config
+        if wc.inventory_accumulation_enabled and not wc.momentum_strategy_enabled:
+            self.strategy = InventoryAccumulationStrategy()
+        else:
+            self.strategy = MomentumStrategy()
 
         _register_worker(self)
 
@@ -2724,13 +2779,21 @@ class MarketWorker:
         return f"{mins:02d}:{secs:02d}"
 
     def is_dry_run(self) -> bool:
-        return self.worker_config.dry_run
+        wc = self.worker_config
+        if not wc.live_trading_enabled:
+            return True
+        return wc.dry_run
 
     def resolved_entry_fok_limit(self):
-        """Tick-normalized minimum entry price (configured floor for eligibility)."""
+        """Legacy minimum entry (unused by momentum strategy)."""
         from utils.entry_limit import resolve_minimum_entry_price
 
         return resolve_minimum_entry_price(self.worker_config.entry_price)
+
+    def resolved_momentum_max_entry(self):
+        from utils.entry_limit import resolve_max_entry_price
+
+        return resolve_max_entry_price(self.worker_config.momentum_max_entry_price)
 
     async def graceful_stop(self) -> None:
         """Stop loops without liquidating open positions."""
@@ -3076,15 +3139,22 @@ class MarketWorker:
         # are removed by cancel_order_confirmed().
 
     async def place_exit_sell(
-        self, side: str, price: float, size: float, *, stop_loss_only: bool = False,
+        self,
+        side: str,
+        price: float,
+        size: float,
+        *,
+        stop_loss_only: bool = False,
+        exit_purpose: str = "stop_loss",
     ) -> Tuple[float, float]:
-        """FOK sell; only the stop-loss caller may authorize this path."""
-        if not stop_loss_only:
-            print("🛑 [SELL BLOCKED] exit sell rejected: stop-loss authorization required")
+        """FOK sell for fixed take-profit or stop-loss exits only."""
+        purpose = exit_purpose if not stop_loss_only else "stop_loss"
+        if purpose not in ("stop_loss", "take_profit"):
+            print("🛑 [SELL BLOCKED] exit sell rejected: unknown exit purpose")
             return 0.0, round(price, 4)
         ok, order_id, _filled = await self.place_order_raw(
             side, price, size, order_type="FOK", action="SELL",
-            _stop_loss_authorized=True,
+            _position_exit_authorized=True,
         )
         if not ok or not order_id:
             return 0.0, round(price, 4)
@@ -3219,6 +3289,7 @@ class MarketWorker:
             allow_unmatched_accumulation=bool(wc.allow_unmatched_accumulation),
             purpose=purpose,
             allow_first_leg_entry=allow_first_leg_entry,
+            max_shares_per_side=max(float(wc.max_shares), float(wc.max_position_size)),
         )
         log_buy_plan(plan, market=market, purpose=purpose)
         if plan.approval == BuyApproval.REJECTED:
@@ -3454,6 +3525,105 @@ class MarketWorker:
                 "size":     size,
             })
 
+    def notify_confirmed_fill(
+        self,
+        *,
+        side: str,
+        action: str,
+        quantity: float,
+        price: float,
+        order_id: Optional[str] = None,
+        realized_pnl_delta: float = 0.0,
+        count_win_loss: bool = False,
+    ) -> None:
+        """Record a confirmed fill in the canonical ledger and refresh dashboard P&L."""
+        fee_rate = self.worker_config.estimated_fee_rate
+        fee = float(quantity) * float(price) * fee_rate
+        market_id = self.canonical_market_id() or ""
+        canonical_ledger.record_fill(
+            worker_key=self.worker_config.key,
+            market_id=market_id,
+            order_id=order_id,
+            side=side,
+            action=action,
+            price=float(price),
+            quantity=float(quantity),
+            fee=fee,
+            realized_pnl_delta=float(realized_pnl_delta),
+            count_win_loss=count_win_loss,
+        )
+        self.sync_accounting_dashboard()
+
+    def sync_accounting_dashboard(self) -> None:
+        """Publish realized/unrealized/total P&L from inventory + canonical ledger."""
+        inv = self.inventory
+        unreal, unreal_pct = self.get_unrealized_pnl()
+        canonical_ledger.backfill_worker_realized_if_missing(
+            self.worker_config.key, inv.realized_pnl,
+        )
+        fee_rate = self.worker_config.estimated_fee_rate
+        snap = InventorySnapshot.from_ledger(inv, fee_rate=fee_rate)
+        combined = matched_combined_average(snap)
+        inv_view = {
+            "yes_shares": inv.yes_shares,
+            "no_shares": inv.no_shares,
+            "unpaired_yes": snap.unpaired_yes,
+            "unpaired_no": snap.unpaired_no,
+            "matched_pairs": inv.matched_pairs,
+            "matched_combined_cost": round(combined, 4) if combined is not None else None,
+        }
+        view = canonical_ledger.build_accounting_view(
+            worker_key=self.worker_config.key,
+            unrealized_pnl=unreal,
+            inventory_snapshot=inv_view,
+        )
+        summary = canonical_ledger.worker_summary(self.worker_config.key)
+        self.dashboard.update(view)
+        self.dashboard["unrealized_pnl_pct"] = unreal_pct
+        self.cumulative_pnl = view["realized_pnl"]
+        self.wins = summary.wins
+        self.losses = summary.losses
+        self.trade_count = summary.wins + summary.losses
+        self._flush_pnl_stats_totals()
+
+    def _flush_pnl_stats_totals(self) -> None:
+        """Keep per-asset JSON/Redis totals aligned with the canonical ledger (no new trade row)."""
+        file_path = asset_pnl_filename(self.asset_type, self.window_slug)
+        total_trades = self.wins + self.losses
+        win_rate_str = (
+            f"{round((self.wins / total_trades) * 100, 2)}%" if total_trades > 0 else "0%"
+        )
+        self._save_stats_to_redis()
+        default_data = {"total_pnl": 0.0, "wins": 0, "losses": 0, "win_rate": "0%", "trades": []}
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = dict(default_data)
+        except Exception:
+            data = dict(default_data)
+        data["total_pnl"] = round(self.cumulative_pnl, 4)
+        data["wins"] = self.wins
+        data["losses"] = self.losses
+        data["win_rate"] = win_rate_str
+        try:
+            _atomic_write_json_file(file_path, data)
+        except Exception as e:
+            print(f"⚠️ PnL totals flush failed (non-fatal): {e}")
+        try:
+            canonical_ledger.sync_bot_pnl_snapshot()
+        except Exception:
+            pass
+
+    def inventory_snapshot_for_api(self) -> dict:
+        self.sync_accounting_dashboard()
+        inv = self.inventory
+        return {
+            **self.dashboard,
+            "inventory": inv.snapshot(),
+        }
+
     # ── Market fetching ────────────────────────────────────────────────
 
     def fetch_target_market(self, url: str) -> bool:
@@ -3502,6 +3672,13 @@ class MarketWorker:
                     yes_id = str(clob_ids[up_idx])
                     no_id = str(clob_ids[down_idx])
             condition_id = m.get("conditionId") or m.get("condition_id") or slug
+            start_ts = 0
+            try:
+                start_ts = int(str(slug).rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                start_ts = 0
+            from utils.market_reference import infer_oracle_from_gamma
+
             self.active_market = {
                 "question": m.get('question'),
                 "yes_id":   yes_id,
@@ -3509,6 +3686,9 @@ class MarketWorker:
                 "expiry":   end_dt,
                 "slug":     slug,
                 "condition_id": str(condition_id),
+                "start_ts": start_ts,
+                "oracle_label": infer_oracle_from_gamma(m),
+                "gamma": m,
             }
             self.market_slug = slug
             print(f"🎯 Market: {self.active_market['question']} | Slug: {slug}")
@@ -3756,6 +3936,7 @@ class MarketWorker:
         order_type: str = "FOK",
         action: str = "BUY",
         _stop_loss_authorized: bool = False,
+        _position_exit_authorized: bool = False,
         _strategy_buy_authorized: bool = False,
         _inventory_accumulation_authorized: bool = False,
         _late_entry_authorized: bool = False,
@@ -3775,12 +3956,13 @@ class MarketWorker:
         else:
             clean_price = clamp_buy_price(price)
 
-        if action.upper() == "SELL" and not _stop_loss_authorized:
+        exit_ok = _position_exit_authorized or _stop_loss_authorized
+        if action.upper() == "SELL" and not exit_ok:
             exec_log("sell_blocked_non_authorized", side=side, price=clean_price,
                      size=size, window=self.window_slug)
             print(
                 f"🛑 [SELL BLOCKED] {self.asset_type.upper()} {self.window_slug} | "
-                f"SELL allowed only for stop-loss FOK"
+                f"SELL allowed only for take-profit or stop-loss FOK"
             )
             return False, None, False
 
@@ -3998,7 +4180,7 @@ class MarketWorker:
         self.dashboard["timer"]             = "--:--"
         self.dashboard["listener"]          = "--:--"
         self.dashboard["outcome"]           = "PENDING"
-        self.dashboard["bought_side"]       = "-"
+        self.dashboard["bought_side"]       = ""
         self.dashboard["entry_price"]       = 0.0
         self.dashboard["status"]            = "WAITING"
         self.dashboard["profit"]            = 0.0
@@ -4064,16 +4246,43 @@ class MarketWorker:
         # already logged (e.g. a retried exit path firing twice), skip the
         # second call entirely rather than double-counting the trade.
         round_key = f"{self.asset_type}:{self.window_slug}:{slug}"
-        if slug != "unknown" and slug == self._last_logged_slug:
+        exit_oid = details.get("order_id") if isinstance(details, dict) else None
+        if outcome_type in ("STOP_LOSS", "TAKE_PROFIT") and exit_oid:
+            if str(exit_oid) in self._logged_exit_order_ids:
+                print(f"ℹ️ [{self.asset_type.upper()}] log_pnl skipped duplicate exit "
+                      f"order {exit_oid}.")
+                return
+            self._logged_exit_order_ids.add(str(exit_oid))
+        elif slug != "unknown" and slug == self._last_logged_slug:
             print(f"ℹ️ [{self.asset_type.upper()}] log_pnl skipped duplicate call for "
                   f"already-logged market {slug}.")
             return
 
-        self.cumulative_pnl = round(self.cumulative_pnl + pnl_amount, 4)
-        if pnl_amount > 0:
-            self.wins   += 1
+        if outcome_type in ("GABAGOOL_SETTLE", "STOP_LOSS", "TAKE_PROFIT"):
+            if outcome_type == "GABAGOOL_SETTLE":
+                market_id = self.canonical_market_id() or ""
+                canonical_ledger.record_fill(
+                    worker_key=self.worker_config.key,
+                    market_id=market_id,
+                    order_id=f"settle:{market_id}",
+                    side="SETTLE",
+                    action="SETTLE",
+                    price=1.0,
+                    quantity=1.0,
+                    fee=0.0,
+                    realized_pnl_delta=float(pnl_amount),
+                    count_win_loss=True,
+                )
+            summary = canonical_ledger.worker_summary(self.worker_config.key)
+            self.cumulative_pnl = round(summary.realized_pnl, 4)
+            self.wins = summary.wins
+            self.losses = summary.losses
         else:
-            self.losses += 1
+            self.cumulative_pnl = round(self.cumulative_pnl + pnl_amount, 4)
+            if pnl_amount > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
         self.trade_count = self.wins + self.losses
         total_trades     = self.trade_count
         win_rate_str     = (f"{round((self.wins / total_trades) * 100, 2)}%"
@@ -4125,12 +4334,7 @@ class MarketWorker:
         data["trades"].append(entry)
 
         try:
-            temp_file = file_path + ".tmp"
-            with open(temp_file, 'w') as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_file, file_path)
+            _atomic_write_json_file(file_path, data)
         except Exception as e:
             print(f"⚠️ Local JSON write failed (non-fatal, Redis has the data): {e}")
 
@@ -4139,10 +4343,13 @@ class MarketWorker:
     def get_dashboard_data(self) -> dict:
         from utils.strategy_display import enrich_dashboard_payload
 
+        self.sync_accounting_dashboard()
         pnl_dollars, pnl_pct, _ = self.get_current_pnl()
         inv = self.inventory
         wc = self.worker_config
-        side = self.dashboard.get("position_side") or ""
+        side = str(self.dashboard.get("position_side") or "").upper().strip()
+        if side not in ("YES", "NO"):
+            side = ""
         pos_size = float(self.dashboard.get("position_size") or 0.0)
         if pos_size <= 0 and side:
             pos_size = inv.shares(side)
@@ -4172,23 +4379,81 @@ class MarketWorker:
         except Exception:
             pass
 
-        min_res = self.resolved_entry_fok_limit()
+        max_res = self.resolved_momentum_max_entry()
         trade_phase = self.dashboard.get("strategy_state", "idle")
+        yes_avg = inv.avg_cost("YES") if inv.yes_shares > 0 else 0.0
+        no_avg = inv.avg_cost("NO") if inv.no_shares > 0 else 0.0
+        fee_rate = wc.estimated_fee_rate
+        inv_snap = InventorySnapshot.from_ledger(inv, fee_rate=fee_rate)
+        combined = matched_combined_average(inv_snap)
+        inventory_mode = bool(wc.inventory_accumulation_enabled) and not bool(
+            wc.momentum_strategy_enabled,
+        )
+        if inventory_mode:
+            strategy_label = "Inventory accumulation"
+            strategy_name = "Pair accumulation"
+            strategy_key = "inventory_pair_accumulation"
+        else:
+            strategy_label = "BTC/ETH Momentum"
+            strategy_name = "BTC/ETH Momentum"
+            strategy_key = "momentum_directional"
         payload = {
             "asset": self.asset_type.upper(),
             "window": self.window_slug,
             "market_id": self.canonical_market_id() or "",
-            "strategy": "directional_fok",
-            "strategy_label": "95c Entry / Stop Loss",
-            "strategy_name": "95c Entry / Stop Loss",
+            "strategy": strategy_key,
+            "strategy_label": strategy_label,
+            "strategy_name": strategy_name,
+            "inventory_accumulation_enabled": inventory_mode,
+            "yes_spent_usd": round(inv.yes_cost, 4),
+            "no_spent_usd": round(inv.no_cost, 4),
+            "total_invested_usd": round(inv.yes_cost + inv.no_cost, 4),
+            "matched_combined_cost": round(combined, 4) if combined is not None else None,
+            "matched_combined_cost_c": (
+                round(combined * 100, 2) if combined is not None else 0.0
+            ),
+            "target_combined_pair_cost_c": round(
+                float(wc.target_combined_pair_cost or wc.combined_cost_target) * 100, 2,
+            ),
+            "inventory_next_action": self.dashboard.get("inventory_next_action", ""),
+            "inventory_action_reason": self.dashboard.get("inventory_action_reason", ""),
+            "accumulation_phase": self.dashboard.get("accumulation_phase", ""),
+            "first_leg_fill": dict(self.dashboard.get("first_leg_fill") or {}),
+            "second_leg_fill": dict(self.dashboard.get("second_leg_fill") or {}),
+            "matched_pairs": round(inv.matched_pairs, 4),
+            "yes_shares": round(inv.yes_shares, 4),
+            "no_shares": round(inv.no_shares, 4),
+            "yes_avg_price": round(yes_avg, 4),
+            "no_avg_price": round(no_avg, 4),
+            "yes_avg_price_c": round(yes_avg * 100, 2) if inv.yes_shares > 0 else 0.0,
+            "no_avg_price_c": round(no_avg * 100, 2) if inv.no_shares > 0 else 0.0,
+            "pair_avg_price_c": (
+                round((yes_avg + no_avg) * 100, 2)
+                if inv.yes_shares > 0 and inv.no_shares > 0 else 0.0
+            ),
+            "bought_side": self.dashboard.get("bought_side") or side,
+            **{k: self.dashboard[k] for k in (
+                "stop_loss_event",
+                "entry_decision",
+                "momentum_signal_display",
+                "signal_quality_score",
+                "entry_net_edge",
+                "take_profit_pct",
+            ) if k in self.dashboard},
             "trade_phase": trade_phase,
             "strategy_state": trade_phase,
-            "minimum_entry_price": min_res.minimum_price,
-            "minimum_entry_price_c": round(min_res.minimum_price * 100, 2),
-            "configured_entry_price": min_res.configured_entry,
-            "configured_entry_price_c": round(min_res.configured_entry * 100, 2),
-            "entry_price": min_res.minimum_price,
-            "entry_price_c": round(min_res.minimum_price * 100, 2),
+            "max_entry_price": max_res.minimum_price,
+            "max_entry_price_c": round(max_res.minimum_price * 100, 2),
+            "min_net_edge": wc.min_net_edge,
+            "min_net_edge_pct": round(wc.min_net_edge * 100, 2),
+            "momentum_direction": self.dashboard.get("momentum_direction", ""),
+            "yes_net_edge": self.dashboard.get("yes_net_edge", 0.0),
+            "no_net_edge": self.dashboard.get("no_net_edge", 0.0),
+            "estimated_yes_probability": self.dashboard.get("estimated_yes_probability", 0.0),
+            "estimated_no_probability": self.dashboard.get("estimated_no_probability", 0.0),
+            "reference_price": self.dashboard.get("reference_price", 0.0),
+            "current_underlying_price": self.dashboard.get("current_underlying_price", 0.0),
+            "resolution_oracle": self.dashboard.get("resolution_oracle", ""),
             "buy_limit_price": self.dashboard.get("buy_limit_price", 0.0),
             "buy_limit_price_c": self.dashboard.get("buy_limit_price_c", 0.0),
             "entry_fill_price": self.dashboard.get("entry_fill_price", 0.0),
@@ -4204,8 +4469,24 @@ class MarketWorker:
             "executable_bid_c": self.dashboard.get("executable_bid_c", 0),
             "stop_loss_trigger_price": self.dashboard.get("stop_loss_trigger_price", 0.0),
             "stop_loss_trigger_c": self.dashboard.get("stop_loss_trigger_c", 0),
+            "take_profit_pct": wc.take_profit_pct,
+            "take_profit_pct_display": round(wc.take_profit_pct * 100, 1),
+            "take_profit_trigger_price": self.dashboard.get("take_profit_trigger_price", 0.0),
+            "take_profit_trigger_c": self.dashboard.get("take_profit_trigger_c", 0),
+            "exit_fill_price": self.dashboard.get("exit_fill_price", 0.0),
+            "exit_fill_price_c": self.dashboard.get("exit_fill_price_c", 0),
+            "exit_reason": self.dashboard.get("exit_reason", ""),
+            "exit_order_type": self.dashboard.get("exit_order_type", "FOK"),
             "unrealized_pnl": self.dashboard.get("unrealized_pnl", pnl_dollars),
-            "realized_pnl": round(inv.realized_pnl, 4),
+            "realized_pnl": self.dashboard.get("realized_pnl", self.cumulative_pnl),
+            "cumulative_realized_pnl": self.dashboard.get(
+                "cumulative_realized_pnl", self.cumulative_pnl,
+            ),
+            "total_net_pnl": self.dashboard.get("total_net_pnl"),
+            "overall_net_pnl": self.dashboard.get(
+                "overall_net_pnl", self.dashboard.get("total_net_pnl"),
+            ),
+            "fees_paid": self.dashboard.get("fees_paid", 0.0),
             "entry_order_status": entry_status,
             "exit_order_status": exit_status,
             "market_stopped_out": self.dashboard.get("market_stopped_out", False),
@@ -4314,6 +4595,17 @@ class MarketWorker:
             settlement += no_unpaired * 1.0
 
         actual_profit = round(settlement - total_cost, 4)
+        if self.entry_count >= 1 and (yes_unpaired > MIN_FILL_DELTA or no_unpaired > MIN_FILL_DELTA):
+            try:
+                from utils.exit_performance import exit_performance_store
+                exit_performance_store.record_settlement(
+                    self.worker_config.key,
+                    pnl=actual_profit,
+                )
+                self.dashboard["strategy_state"] = "position_settled"
+                self.dashboard["exit_reason"] = "market_settlement"
+            except Exception:
+                pass
 
         print(f"\n\n{BOLD}{GREEN}--- 📊 GABAGOOL SETTLEMENT ---{RESET}")
         print(f"⏱️ Market Outcome:      {outcome}")
@@ -4346,6 +4638,7 @@ class MarketWorker:
             "settlement_value": settlement,
             "entry_count":      self.entry_count,
         })
+        canonical_ledger.sync_bot_pnl_snapshot()
         self._finish_market_merge()
 
     def _finish_market_merge(self) -> None:
@@ -4405,12 +4698,14 @@ class MarketWorker:
     async def start(self):
         """Per-worker trading loop for one (asset, window) pair."""
         wc = self.worker_config
-        print(f"🤖 EmilianoBot — Directional FOK (entry + stop-loss) → "
+        print(f"🤖 EmilianoBot — Momentum + delayed adjustment → "
               f"{self.asset_type.upper()} {self.window_slug} markets...")
         print(f"  Market interval   : {wc.window} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        print(f"  Minimum entry     : >= {wc.entry_price:.2f} (best ask)")
+        print(f"  Min net edge      : {wc.min_net_edge:.2%}")
+        print(f"  Max entry price   : {wc.momentum_max_entry_price:.2f}")
         print(f"  Stop loss         : {wc.stop_loss_pct:.0%}")
+        print(f"  Live trading      : {wc.live_trading_enabled} (dry_run={self.is_dry_run()})")
         if wc.entry_window_seconds > 0:
             print(f"  Entry window      : final {wc.entry_window_seconds}s")
         else:
@@ -4514,7 +4809,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — 95c+ Min Entry / Stop Loss (FOK)[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Momentum Inventory Accumulation (FOK)[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -4534,7 +4829,7 @@ def create_dashboard(bots):
 
         display_status = d.get("strategy_display_state", d.get("status", "WAITING FOR ENTRY"))
         entry_c = d.get("entry_price_c", d.get("buy_limit_price_c", 0))
-        stop_pct = round(float(d.get("stop_loss_pct", 0.35)) * 100)
+        stop_pct = round(float(d.get("stop_loss_pct", 0.20)) * 100)
         side = d.get("position_side") or "—"
         limit_c = d.get("buy_limit_price_c", 0)
         fill_c = d.get("entry_fill_price_c", 0)
@@ -4742,6 +5037,21 @@ def merge_all_pnl(send_telegram_notify: bool = False):
 #      PnL-merge scheduler — those only ever exist once per process.
 # ═════════════════════════════════════════════════════════════════════════════
 
+_BINANCE_FEED_ASSETS = frozenset({"BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"})
+
+
+async def ensure_binance_feeds_for_workers(
+    worker_configs: Optional[Tuple[WorkerConfig, ...]] = None,
+) -> None:
+    """Start shared Binance spot WS feeds for configured trading assets."""
+    configs = worker_configs or WORKER_CONFIGS
+    for asset in dict.fromkeys(wc.asset for wc in configs):
+        sym = asset.upper()
+        if sym in _BINANCE_FEED_ASSETS:
+            await BinanceDepthSignal.get_or_create(sym)
+            print(f"📡 [Binance] External feed starting for {sym}USDT")
+
+
 async def main():
     from utils.graceful_shutdown import (
         get_shutdown_event,
@@ -4760,6 +5070,8 @@ async def main():
         console.print("[bold red]Wallet audit failed — aborting startup.[/bold red]")
         return
     account.start_pnl_merge_scheduler()
+
+    await ensure_binance_feeds_for_workers()
 
     bots = [MarketWorker(wc, account) for wc in WORKER_CONFIGS]
 
@@ -4786,11 +5098,12 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("Starting EmilianoBot — directional FOK (minimum entry + stop-loss)")
+        print("Starting EmilianoBot — momentum + delayed Polymarket adjustment")
         for wc in WORKER_CONFIGS:
             print(
-                f"   {wc.asset.upper()} {wc.window}: min entry >={wc.entry_price:.2f} "
-                f"| stop {wc.stop_loss_pct:.0%} | order={wc.order_size} | dry_run={wc.dry_run}"
+                f"   {wc.asset.upper()} {wc.window}: edge>={wc.min_net_edge:.2%} "
+                f"| max entry {wc.momentum_max_entry_price:.2f} "
+                f"| stop {wc.stop_loss_pct:.0%} | dry_run={wc.dry_run} | live={wc.live_trading_enabled}"
             )
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -59,3 +59,33 @@ def compute_buy_fok_limit_price(
     if limit > _MAX_BUY + 1e-9:
         return None, "above_max_token_price"
     return limit, "ok"
+
+
+def compute_momentum_buy_fok_limit_price(
+    executable_avg: float,
+    max_entry_price: float,
+) -> Tuple[Optional[float], str]:
+    """FOK BUY limit for momentum strategy: walk price capped by max_entry_price."""
+    raw = float(executable_avg)
+    if raw <= 0:
+        return None, "missing_executable_ask"
+    cap = clamp_buy_price(float(max_entry_price))
+    if raw > cap + 1e-9:
+        return None, "above_max_entry_price"
+    limit = clamp_buy_price(raw)
+    if limit > _MAX_BUY + 1e-9:
+        return None, "above_max_token_price"
+    return limit, "ok"
+
+
+def resolve_max_entry_price(configured_max: float) -> MinimumEntryResolution:
+    configured = float(configured_max)
+    aligned_price = clamp_buy_price(configured)
+    aligned = abs(aligned_price - configured) <= 0.005 + 1e-9
+    reason = "ok" if aligned else "max_entry_adjusted_to_tick"
+    return MinimumEntryResolution(
+        minimum_price=aligned_price,
+        configured_entry=configured,
+        tick_aligned=aligned,
+        reason=reason,
+    )

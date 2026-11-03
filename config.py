@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -178,7 +178,7 @@ class WorkerConfig:
     window: str
     # Legacy fields kept for dashboard/backward compatibility. Gabagool does not use them for entries/exits.
     momentum_entry_threshold: float = 0.90
-    stop_loss_pct: float = 0.35
+    stop_loss_pct: float = 0.20
     price_99_entry_window_seconds: int = 60
     inventory_accumulation_enabled: bool = True
     cheap_side_min_price: float = 0.10
@@ -189,6 +189,7 @@ class WorkerConfig:
     no_buys_last_minutes: int = 2
     cheap_entry_price: float = 0.20
     initial_hedge_delay_seconds: int = 0
+    initial_hedge_timeout_seconds: float = 4.0
     combined_cost_target: float = 0.98
     max_combined_cost: float = 0.98
     entry_window_seconds: int = 60
@@ -308,6 +309,50 @@ class WorkerConfig:
     min_entry_seconds_left: int = 0
     fill_timeout_ms: int = 10000
     fill_poll_ms: int = 400
+    momentum_strategy_enabled: bool = True
+    live_trading_enabled: bool = False
+    momentum_max_entry_price: float = 0.92
+    min_net_edge: float = 0.05
+    momentum_windows_seconds: tuple = (5, 15, 30, 60, 120)
+    min_momentum_strength: float = 0.75
+    momentum_volatility_cap: float = 0.08
+    volume_confirmation_threshold: float = 0.05
+    momentum_reversal_exit_enabled: bool = True
+    momentum_reversal_confirm_strength: float = 0.6
+    momentum_reversal_confirmations: int = 2
+    max_holding_time_seconds: float = 240.0
+    estimated_fee_rate: float = 0.0
+    execution_slippage_buffer: float = 0.02
+    external_max_data_age_seconds: float = 3.0
+    take_profit_pct: float = 0.10
+    take_profit_delta: float = 0.08  # legacy; ignored when take_profit_pct is set in config
+    min_signal_quality_score: float = 60.0
+    signal_gate_windows_seconds: tuple = (5, 15, 30)
+    signal_require_timeframe_agreement: bool = False
+    momentum_trigger_window_seconds: int = 5
+    momentum_confirm_window_seconds: int = 15
+    momentum_support_window_seconds: int = 30
+    momentum_context_window_seconds: int = 60
+    momentum_trigger_min_abs_return: float = 0.00005
+    momentum_confirm_tolerance: float = 0.0001
+    momentum_support_opposing_tolerance: float = 0.002
+    momentum_context_reversal_min_abs_return: float = 0.004
+    momentum_require_volume_confirmation: bool = False
+    matched_pair_accumulation_enabled: bool = False
+    signal_max_spread: float = 0.06
+    signal_max_slippage: float = 0.03
+    signal_max_token_move_since_open: float = 0.12
+    signal_min_persistence_ratio: float = 0.55
+    signal_reversal_acceleration_threshold: float = -0.0005
+    signal_quality_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "momentum_alignment": 25.0,
+            "persistence_acceleration": 20.0,
+            "net_edge": 25.0,
+            "liquidity_spread": 15.0,
+            "reference_time": 15.0,
+        }
+    )
     enabled: bool = True
 
     @property
@@ -353,7 +398,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         momentum_entry_threshold = _parse_unit_fraction(
             "MOMENTUM_ENTRY_THRESHOLD", env_momentum, momentum_entry_threshold,
         )
-    stop_loss_raw = _cfg_get(raw, defaults, "stop_loss_pct", default=0.35)
+    stop_loss_raw = _cfg_get(raw, defaults, "stop_loss_pct", default=0.20)
     env_stop = os.getenv("STOP_LOSS_PERCENT", os.getenv("STOP_LOSS_PCT", "")).strip()
     if env_stop:
         stop_loss_raw = env_stop
@@ -480,6 +525,15 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _fatal(f"initial_hedge_delay_seconds={hedge_delay_raw!r} is not a valid integer")
     if initial_hedge_delay_seconds < 0:
         _fatal(f"{asset}:{window}: initial_hedge_delay_seconds must be >= 0")
+
+    initial_hedge_timeout_seconds = _parse_nonnegative_float(
+        "initial_hedge_timeout_seconds",
+        os.getenv(
+            "INITIAL_HEDGE_TIMEOUT_SECONDS",
+            _cfg_get(raw, defaults, "initial_hedge_timeout_seconds", default=4.0),
+        ),
+        4.0,
+    )
 
     order_type = str(
         os.getenv("ORDER_TYPE", _cfg_get(raw, defaults, "order_type", default="FOK"))
@@ -1124,6 +1178,217 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     if fill_poll_ms > fill_timeout_ms:
         _fatal(f"{asset}:{window}: fill_poll_ms must be <= fill_timeout_ms")
 
+    momentum_strategy_enabled = _parse_bool_value(
+        "momentum_strategy_enabled",
+        _cfg_get(raw, defaults, "momentum_strategy_enabled", default=True),
+        True,
+    )
+    live_trading_enabled = _parse_bool_value(
+        "live_trading_enabled",
+        os.getenv(
+            "LIVE_TRADING_ENABLED",
+            _cfg_get(raw, defaults, "live_trading_enabled", default=False),
+        ),
+        False,
+    )
+    momentum_max_entry_price = _parse_unit_fraction(
+        "momentum_max_entry_price",
+        _cfg_get(raw, defaults, "momentum_max_entry_price", "max_entry_price", default=0.92),
+        0.92,
+    )
+    min_net_edge = _parse_nonnegative_float(
+        "min_net_edge",
+        _cfg_get(raw, defaults, "min_net_edge", "inventory_min_net_edge", default=0.05),
+        0.05,
+    )
+    if min_net_edge >= 1:
+        _fatal(f"{asset}:{window}: min_net_edge must be < 1")
+    windows_raw = _cfg_get(raw, defaults, "momentum_windows_seconds", default=[5, 15, 30, 60, 120])
+    if isinstance(windows_raw, str):
+        windows_raw = [p.strip() for p in windows_raw.split(",") if p.strip()]
+    momentum_windows_seconds = tuple(int(float(w)) for w in (windows_raw or []))
+    if not momentum_windows_seconds or any(w <= 0 for w in momentum_windows_seconds):
+        _fatal(f"{asset}:{window}: momentum_windows_seconds must be positive integers")
+    min_momentum_strength = _parse_nonnegative_float(
+        "min_momentum_strength",
+        _cfg_get(raw, defaults, "min_momentum_strength", default=0.75),
+        0.75,
+    )
+    momentum_volatility_cap = _parse_nonnegative_float(
+        "momentum_volatility_cap",
+        _cfg_get(raw, defaults, "momentum_volatility_cap", default=0.08),
+        0.08,
+    )
+    volume_confirmation_threshold = _parse_nonnegative_float(
+        "volume_confirmation_threshold",
+        _cfg_get(raw, defaults, "volume_confirmation_threshold", default=0.05),
+        0.05,
+    )
+    momentum_reversal_exit_enabled = _parse_bool_value(
+        "momentum_reversal_exit_enabled",
+        _cfg_get(raw, defaults, "momentum_reversal_exit_enabled", default=True),
+        True,
+    )
+    momentum_reversal_confirm_strength = _parse_nonnegative_float(
+        "momentum_reversal_confirm_strength",
+        _cfg_get(raw, defaults, "momentum_reversal_confirm_strength", default=0.6),
+        0.6,
+    )
+    momentum_reversal_confirmations = int(
+        _cfg_get(raw, defaults, "momentum_reversal_confirmations", default=2) or 2
+    )
+    if momentum_reversal_confirmations < 1:
+        _fatal(f"{asset}:{window}: momentum_reversal_confirmations must be >= 1")
+    max_holding_time_seconds = _parse_nonnegative_float(
+        "max_holding_time_seconds",
+        _cfg_get(raw, defaults, "max_holding_time_seconds", default=240.0),
+        240.0,
+    )
+    estimated_fee_rate = _parse_nonnegative_float(
+        "estimated_fee_rate",
+        _cfg_get(raw, defaults, "estimated_fee_rate", "spread_capture_fee_rate", default=0.0),
+        0.0,
+    )
+    execution_slippage_buffer = _parse_nonnegative_float(
+        "execution_slippage_buffer",
+        _cfg_get(
+            raw,
+            defaults,
+            "execution_slippage_buffer",
+            "spread_capture_slippage_buffer",
+            default=0.02,
+        ),
+        0.02,
+    )
+    external_max_data_age_seconds = _parse_nonnegative_float(
+        "external_max_data_age_seconds",
+        _cfg_get(
+            raw,
+            defaults,
+            "external_max_data_age_seconds",
+            "binance_fok_max_binance_data_age_ms",
+            default=3.0,
+        ),
+        3.0,
+    )
+    if external_max_data_age_seconds > 120:
+        external_max_data_age_seconds /= 1000.0
+
+    take_profit_pct_raw = _cfg_get(raw, defaults, "take_profit_pct", default=None)
+    if take_profit_pct_raw is None:
+        take_profit_pct = 0.10
+    else:
+        take_profit_pct = _parse_nonnegative_float(
+            "take_profit_pct",
+            take_profit_pct_raw,
+            0.10,
+        )
+    if take_profit_pct > 1.0:
+        take_profit_pct /= 100.0
+    if take_profit_pct <= 0 or take_profit_pct >= 1 or take_profit_pct != take_profit_pct:
+        _fatal(f"{asset}:{window}: take_profit_pct must be in (0, 1) (got {take_profit_pct_raw!r})")
+
+    take_profit_delta = _parse_nonnegative_float(
+        "take_profit_delta",
+        _cfg_get(raw, defaults, "take_profit_delta", default=0.08),
+        0.08,
+    )
+
+    min_signal_quality_score = _parse_nonnegative_float(
+        "min_signal_quality_score",
+        _cfg_get(raw, defaults, "min_signal_quality_score", default=60.0),
+        60.0,
+    )
+    if min_signal_quality_score > 100:
+        _fatal(f"{asset}:{window}: min_signal_quality_score must be <= 100")
+    gate_windows_raw = _cfg_get(raw, defaults, "signal_gate_windows_seconds", default=[5, 15, 30])
+    if isinstance(gate_windows_raw, str):
+        gate_windows_raw = [p.strip() for p in gate_windows_raw.split(",") if p.strip()]
+    signal_gate_windows_seconds = tuple(int(float(w)) for w in (gate_windows_raw or [5, 15, 30]))
+    signal_require_timeframe_agreement = _parse_bool_value(
+        "signal_require_timeframe_agreement",
+        _cfg_get(raw, defaults, "signal_require_timeframe_agreement", default=False),
+        False,
+    )
+    momentum_trigger_window_seconds = int(
+        _cfg_get(raw, defaults, "momentum_trigger_window_seconds", default=5) or 5
+    )
+    momentum_confirm_window_seconds = int(
+        _cfg_get(raw, defaults, "momentum_confirm_window_seconds", default=15) or 15
+    )
+    momentum_support_window_seconds = int(
+        _cfg_get(raw, defaults, "momentum_support_window_seconds", default=30) or 30
+    )
+    momentum_context_window_seconds = int(
+        _cfg_get(raw, defaults, "momentum_context_window_seconds", default=60) or 60
+    )
+    momentum_trigger_min_abs_return = _parse_nonnegative_float(
+        "momentum_trigger_min_abs_return",
+        _cfg_get(raw, defaults, "momentum_trigger_min_abs_return", default=0.00005),
+        0.00005,
+    )
+    momentum_confirm_tolerance = _parse_nonnegative_float(
+        "momentum_confirm_tolerance",
+        _cfg_get(raw, defaults, "momentum_confirm_tolerance", default=0.0001),
+        0.0001,
+    )
+    momentum_support_opposing_tolerance = _parse_nonnegative_float(
+        "momentum_support_opposing_tolerance",
+        _cfg_get(raw, defaults, "momentum_support_opposing_tolerance", default=0.002),
+        0.002,
+    )
+    momentum_context_reversal_min_abs_return = _parse_nonnegative_float(
+        "momentum_context_reversal_min_abs_return",
+        _cfg_get(raw, defaults, "momentum_context_reversal_min_abs_return", default=0.004),
+        0.004,
+    )
+    momentum_require_volume_confirmation = _parse_bool_value(
+        "momentum_require_volume_confirmation",
+        _cfg_get(raw, defaults, "momentum_require_volume_confirmation", default=False),
+        False,
+    )
+    matched_pair_accumulation_enabled = _parse_bool_value(
+        "matched_pair_accumulation_enabled",
+        _cfg_get(raw, defaults, "matched_pair_accumulation_enabled", default=False),
+        False,
+    )
+    signal_max_spread = _parse_nonnegative_float(
+        "signal_max_spread",
+        _cfg_get(raw, defaults, "signal_max_spread", default=0.06),
+        0.06,
+    )
+    signal_max_slippage = _parse_nonnegative_float(
+        "signal_max_slippage",
+        _cfg_get(raw, defaults, "signal_max_slippage", default=0.03),
+        0.03,
+    )
+    signal_max_token_move_since_open = _parse_nonnegative_float(
+        "signal_max_token_move_since_open",
+        _cfg_get(raw, defaults, "signal_max_token_move_since_open", default=0.12),
+        0.12,
+    )
+    signal_min_persistence_ratio = _parse_nonnegative_float(
+        "signal_min_persistence_ratio",
+        _cfg_get(raw, defaults, "signal_min_persistence_ratio", default=0.55),
+        0.55,
+    )
+    if signal_min_persistence_ratio > 1:
+        _fatal(f"{asset}:{window}: signal_min_persistence_ratio must be <= 1")
+    signal_reversal_acceleration_threshold = float(
+        _cfg_get(raw, defaults, "signal_reversal_acceleration_threshold", default=-0.0005)
+    )
+    weights_raw = _cfg_get(raw, defaults, "signal_quality_weights", default={}) or {}
+    default_weights = {
+        "momentum_alignment": 25.0,
+        "persistence_acceleration": 20.0,
+        "net_edge": 25.0,
+        "liquidity_spread": 15.0,
+        "reference_time": 15.0,
+    }
+    signal_quality_weights = {
+        k: float(weights_raw.get(k, default_weights[k])) for k in default_weights
+    }
+
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         enabled = str(enabled).lower() in ("1", "true", "yes", "on")
@@ -1144,6 +1409,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         no_buys_last_minutes=no_buys_last_minutes,
         cheap_entry_price=cheap_entry_price,
         initial_hedge_delay_seconds=initial_hedge_delay_seconds,
+        initial_hedge_timeout_seconds=initial_hedge_timeout_seconds,
         combined_cost_target=combined_cost_target,
         max_combined_cost=max_combined_cost,
         entry_window_seconds=entry_window_seconds,
@@ -1260,6 +1526,42 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         min_entry_seconds_left=min_entry_secs,
         fill_timeout_ms=fill_timeout_ms,
         fill_poll_ms=fill_poll_ms,
+        momentum_strategy_enabled=momentum_strategy_enabled,
+        live_trading_enabled=live_trading_enabled,
+        momentum_max_entry_price=momentum_max_entry_price,
+        min_net_edge=min_net_edge,
+        momentum_windows_seconds=momentum_windows_seconds,
+        min_momentum_strength=min_momentum_strength,
+        momentum_volatility_cap=momentum_volatility_cap,
+        volume_confirmation_threshold=volume_confirmation_threshold,
+        momentum_reversal_exit_enabled=momentum_reversal_exit_enabled,
+        momentum_reversal_confirm_strength=momentum_reversal_confirm_strength,
+        momentum_reversal_confirmations=momentum_reversal_confirmations,
+        max_holding_time_seconds=max_holding_time_seconds,
+        estimated_fee_rate=estimated_fee_rate,
+        execution_slippage_buffer=execution_slippage_buffer,
+        external_max_data_age_seconds=external_max_data_age_seconds,
+        take_profit_pct=take_profit_pct,
+        take_profit_delta=take_profit_delta,
+        min_signal_quality_score=min_signal_quality_score,
+        signal_gate_windows_seconds=signal_gate_windows_seconds,
+        signal_require_timeframe_agreement=signal_require_timeframe_agreement,
+        signal_max_spread=signal_max_spread,
+        signal_max_slippage=signal_max_slippage,
+        signal_max_token_move_since_open=signal_max_token_move_since_open,
+        signal_min_persistence_ratio=signal_min_persistence_ratio,
+        signal_reversal_acceleration_threshold=signal_reversal_acceleration_threshold,
+        signal_quality_weights=signal_quality_weights,
+        momentum_trigger_window_seconds=momentum_trigger_window_seconds,
+        momentum_confirm_window_seconds=momentum_confirm_window_seconds,
+        momentum_support_window_seconds=momentum_support_window_seconds,
+        momentum_context_window_seconds=momentum_context_window_seconds,
+        momentum_trigger_min_abs_return=momentum_trigger_min_abs_return,
+        momentum_confirm_tolerance=momentum_confirm_tolerance,
+        momentum_support_opposing_tolerance=momentum_support_opposing_tolerance,
+        momentum_context_reversal_min_abs_return=momentum_context_reversal_min_abs_return,
+        momentum_require_volume_confirmation=momentum_require_volume_confirmation,
+        matched_pair_accumulation_enabled=matched_pair_accumulation_enabled,
         enabled=enabled,
     )
 
@@ -1380,7 +1682,9 @@ if WORKER_CONFIGS:
             f"max_order={wc0.max_order_size} | max_shares={wc0.max_shares}"
         )
     print(
-        f"📈 Directional FOK: min entry>={wc0.entry_price:.2f} | "
-        f"stop_loss={wc0.stop_loss_pct:.0%} | "
-        f"order={wc0.order_size_max} sh | FOK only"
+        f"📈 Momentum strategy: min_edge={wc0.min_net_edge:.2%} | "
+        f"max_entry={wc0.momentum_max_entry_price:.2f} | "
+        f"take_profit=+{wc0.take_profit_pct:.0%} | "
+        f"stop_loss={wc0.stop_loss_pct:.0%} | dry_run={wc0.dry_run} | "
+        f"live={wc0.live_trading_enabled}"
     )

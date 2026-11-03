@@ -114,6 +114,111 @@ def evaluate_cheap_entry(
     return PurchaseEvaluation(PurchaseDecision.BUY, "cheap_entry_ok", px, None, None)
 
 
+def evaluate_emergency_hedge(
+    snap: InventorySnapshot,
+    hedge_side: str,
+    qty: float,
+    executable_price: float,
+    *,
+    max_combined_cost: float = 1.0,
+    ignore_combined_cap: bool = False,
+) -> PurchaseEvaluation:
+    """Market hedge after timeout — combined cost may reach ``max_combined_cost`` (e.g. $1.00)."""
+    if qty <= _EPS or executable_price <= 0:
+        return PurchaseEvaluation(PurchaseDecision.SKIP, "invalid_emergency_hedge", executable_price, None, None)
+    current = matched_combined_average(snap)
+    after = snap.with_buy(hedge_side, qty, executable_price)
+    resulting = matched_combined_average(after)
+    if resulting is None:
+        return PurchaseEvaluation(PurchaseDecision.SKIP, "emergency_no_matched_pair", executable_price, None, current)
+    if not ignore_combined_cap and resulting > max_combined_cost + _EPS:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_COMBINED_COST_TOO_HIGH",
+            executable_price,
+            resulting,
+            current,
+        )
+    if ignore_combined_cap and resulting is not None and resulting > 2.0 + _EPS:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_COMBINED_COST_IMPLausible",
+            executable_price,
+            resulting,
+            current,
+        )
+    return PurchaseEvaluation(
+        PurchaseDecision.BUY,
+        "emergency_hedge_allowed",
+        executable_price,
+        resulting,
+        current,
+    )
+
+
+def evaluate_rebalance_purchase(
+    snap: InventorySnapshot,
+    side: str,
+    qty: float,
+    executable_price: float,
+    *,
+    max_combined_cost: float = 1.0,
+    min_net_profit_per_pair: float = 0.0,
+    slippage_reserve: float = 0.0,
+) -> PurchaseEvaluation:
+    """Buy the lagging leg to close share imbalance while keeping combined cost under cap."""
+    if qty <= _EPS or executable_price <= 0:
+        return PurchaseEvaluation(PurchaseDecision.SKIP, "invalid_rebalance_qty_or_price", executable_price, None, None)
+    side_u = side.upper()
+    if side_u == "YES":
+        if snap.unpaired_no <= _EPS:
+            return PurchaseEvaluation(
+                PurchaseDecision.SKIP, "rebalance_not_needed_on_yes", executable_price, None, None,
+            )
+        gap = snap.unpaired_no
+    else:
+        if snap.unpaired_yes <= _EPS:
+            return PurchaseEvaluation(
+                PurchaseDecision.SKIP, "rebalance_not_needed_on_no", executable_price, None, None,
+            )
+        gap = snap.unpaired_yes
+    if gap <= _EPS:
+        return PurchaseEvaluation(PurchaseDecision.SKIP, "already_balanced", executable_price, None, matched_combined_average(snap))
+    if qty > gap + _EPS:
+        qty = gap
+    current = matched_combined_average(snap)
+    after = snap.with_buy(side_u, qty, executable_price)
+    resulting = matched_combined_average(after)
+    if resulting is None:
+        return PurchaseEvaluation(PurchaseDecision.SKIP, "rebalance_no_matched_pair", executable_price, None, current)
+    if resulting > max_combined_cost + _EPS:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_COMBINED_COST_TOO_HIGH",
+            executable_price,
+            resulting,
+            current,
+        )
+    from utils.profitability_gate import projected_net_profit_per_pair
+
+    net_p = projected_net_profit_per_pair(resulting, slippage_reserve=slippage_reserve)
+    if net_p + _EPS < min_net_profit_per_pair:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_NET_PROFIT_TOO_LOW",
+            executable_price,
+            resulting,
+            current,
+        )
+    return PurchaseEvaluation(
+        PurchaseDecision.BUY,
+        "rebalance_eligible",
+        executable_price,
+        resulting,
+        current,
+    )
+
+
 def evaluate_initial_hedge(
     snap: InventorySnapshot,
     opposite_side: str,

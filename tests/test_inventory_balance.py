@@ -190,6 +190,44 @@ class InventoryBalanceTests(unittest.TestCase):
         self.assertEqual(plan.approval, BuyApproval.APPROVED)
         self.assertAlmostEqual(plan.approved_qty, 5.0)
 
+    def test_dca_average_down_allowed_from_balanced_five_five(self):
+        snap = InventorySnapshot(yes_shares=5, no_shares=5, yes_cost=2.75, no_cost=2.25)
+        eff = EffectiveInventory(yes_confirmed=5, no_confirmed=5)
+        plan = plan_single_leg_buy(
+            snap=snap,
+            eff=eff,
+            side="NO",
+            requested_qty=5,
+            min_order_size=5,
+            max_share_imbalance=0,
+            max_unmatched_shares=10,
+            balance_inventory_before_buy=True,
+            allow_unmatched_accumulation=True,
+            purpose="dca_average_down",
+            max_shares_per_side=10,
+        )
+        self.assertEqual(plan.approval, BuyApproval.APPROVED)
+        self.assertAlmostEqual(plan.approved_qty, 5.0)
+
+    def test_dca_average_down_blocked_at_side_cap(self):
+        snap = InventorySnapshot(yes_shares=5, no_shares=10, yes_cost=2.75, no_cost=3.5)
+        eff = EffectiveInventory(yes_confirmed=5, no_confirmed=10)
+        plan = plan_single_leg_buy(
+            snap=snap,
+            eff=eff,
+            side="NO",
+            requested_qty=5,
+            min_order_size=5,
+            max_share_imbalance=10,
+            max_unmatched_shares=10,
+            balance_inventory_before_buy=True,
+            allow_unmatched_accumulation=True,
+            purpose="dca_average_down",
+            max_shares_per_side=10,
+        )
+        self.assertEqual(plan.approval, BuyApproval.REJECTED)
+        self.assertIn("max_shares_per_side", plan.reason)
+
     def test_first_leg_cheap_entry_from_flat(self):
         snap = InventorySnapshot(yes_shares=0, no_shares=0, yes_cost=0, no_cost=0)
         eff = EffectiveInventory(0, 0)
