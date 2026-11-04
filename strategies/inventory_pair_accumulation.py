@@ -16,7 +16,7 @@ from utils.dynamic_arbitrage_engine import (
     hedge_deadline_from_fill,
 )
 from utils.graceful_shutdown import shutdown_requested
-from utils.inventory_balance import BuyApproval, log_buy_plan, plan_single_leg_buy
+from utils.inventory_balance import BuyApproval, log_buy_plan, plan_paired_buy, plan_single_leg_buy
 from utils.inventory_cost import InventorySnapshot, matched_combined_average
 from utils.inventory_strategy_store import (
     AccumulationPhase,
@@ -49,6 +49,8 @@ class InventoryPairAccumulationStrategy:
             min_order_size=float(wc.min_order_size),
             fee_rate=float(wc.spread_capture_fee_rate),
             hedge_timeout_seconds=float(wc.initial_hedge_timeout_seconds),
+            endgame_rebalance_seconds=float(wc.endgame_rebalance_seconds),
+            endgame_rebalance_max_combined_cost=float(wc.endgame_rebalance_max_combined_cost),
         )
 
     def _max_unmatched(self, worker: "MarketWorker") -> float:
@@ -134,10 +136,65 @@ class InventoryPairAccumulationStrategy:
                     price=fill_px,
                     kind=action.value,
                 )
+                if action == ArbitrageAction.AVERAGE_DOWN:
+                    combined = matched_combined_average(
+                        InventorySnapshot.from_ledger(worker.inventory, fee_rate=0.0),
+                    )
+                    if combined is not None and combined <= self._arb_cfg(worker).target_combined_cost + 1e-9:
+                        rec.target_achieved = True
+                        inventory_strategy_store.upsert(rec)
         worker.dashboard["entry_fill_price"] = round(fill_px, 4)
         worker.dashboard["strategy_state"] = action.value
         if hasattr(worker, "sync_accounting_dashboard"):
             worker.sync_accounting_dashboard()
+
+    async def _execute_paired_dca(
+        self,
+        worker: "MarketWorker",
+        decision,
+        *,
+        cid: str,
+        wc,
+    ) -> None:
+        from bot import OrderState
+
+        snap = InventorySnapshot.from_ledger(worker.inventory, fee_rate=wc.spread_capture_fee_rate)
+        market = worker.active_market.get("question", "") if worker.active_market else ""
+        plan = plan_paired_buy(
+            snap=snap,
+            eff=worker.effective_inventory(),
+            requested_qty=decision.qty,
+            min_order_size=float(wc.min_order_size),
+            max_share_imbalance=float(wc.max_share_imbalance),
+            balance_inventory_before_buy=bool(wc.balance_inventory_before_buy),
+            max_shares_per_side=self._max_shares_per_side(worker),
+        )
+        log_buy_plan(plan.yes_plan, market=market, purpose="paired_dca")
+        if plan.approval != BuyApproval.APPROVED or plan.qty <= 0:
+            worker.dashboard["entry_block_reason"] = plan.reason
+            return
+        qty = plan.qty
+        legs = (
+            ("YES", decision.yes_limit_price),
+            ("NO", decision.no_limit_price),
+        )
+        async with worker._order_lock:
+            for side, limit_px in legs:
+                if worker.order_state != OrderState.IDLE:
+                    worker.dashboard["entry_block_reason"] = "paired_dca_interrupted"
+                    return
+                worker.order_state = OrderState.PENDING
+                limit_px = clamp_buy_price(limit_px)
+                qty_f, fill_px, oid = await fok_buy_limit(
+                    worker, side, limit_px, qty, purpose="inventory_dca",
+                )
+                worker.order_state = OrderState.IDLE
+                if qty_f <= 0:
+                    worker.dashboard["entry_block_reason"] = "paired_dca_fok_failed"
+                    return
+                await self._record_buy(
+                    worker, side, qty_f, fill_px, limit_px, oid, action=ArbitrageAction.AVERAGE_DOWN,
+                )
 
     async def _execute_decision(
         self,
@@ -150,9 +207,12 @@ class InventoryPairAccumulationStrategy:
 
         if decision.action == ArbitrageAction.NONE or decision.qty <= 0:
             return
+        wc = worker.worker_config
+        if decision.paired:
+            await self._execute_paired_dca(worker, decision, cid=cid, wc=wc)
+            return
         purpose = self._purpose_for_action(decision.action)
         allow_first = decision.action == ArbitrageAction.FIRST_LEG
-        wc = worker.worker_config
         snap = InventorySnapshot.from_ledger(worker.inventory, fee_rate=wc.spread_capture_fee_rate)
         market = worker.active_market.get("question", "") if worker.active_market else ""
         plan = plan_single_leg_buy(
@@ -242,11 +302,9 @@ class InventoryPairAccumulationStrategy:
         self._publish_dashboard(worker)
         if worker.order_state.name == "PENDING" or worker._order_lock.locked():
             return
-        if worker.market_seconds_left() <= worker.worker_config.min_time_before_close_seconds:
-            worker.dashboard["entry_block_reason"] = "too_close_to_resolution"
-            return
-
         wc = worker.worker_config
+        seconds_left = worker.market_seconds_left()
+        min_close = float(wc.min_time_before_close_seconds)
         size = float(wc.min_order_size)
         yes_exe = worker.executable_buy("YES", size)
         no_exe = worker.executable_buy("NO", size)
@@ -260,6 +318,7 @@ class InventoryPairAccumulationStrategy:
                 hedge_delay_seconds=float(wc.initial_hedge_delay_seconds),
                 hedge_timeout_seconds=float(wc.initial_hedge_timeout_seconds),
             )
+        target_achieved = bool(rec and rec.target_achieved)
         decision = evaluate_inventory_tick(
             snap,
             now=time.time(),
@@ -268,9 +327,24 @@ class InventoryPairAccumulationStrategy:
             yes_exe=yes_exe,
             no_exe=no_exe,
             cfg=self._arb_cfg(worker),
+            seconds_to_close=seconds_left,
+            target_achieved=target_achieved,
         )
         worker.dashboard["inventory_next_action"] = decision.action.value
         worker.dashboard["inventory_action_reason"] = decision.reason
+        if seconds_left <= min_close:
+            unhedged = (
+                (snap.yes_shares > 1e-9 and snap.no_shares <= 1e-9)
+                or (snap.no_shares > 1e-9 and snap.yes_shares <= 1e-9)
+            )
+            salvage = {
+                ArbitrageAction.REBALANCE,
+                ArbitrageAction.EMERGENCY_HEDGE,
+                ArbitrageAction.IDEAL_HEDGE,
+            }
+            if not unhedged and decision.action not in salvage:
+                worker.dashboard["entry_block_reason"] = "too_close_to_resolution"
+                return
         if decision.action != ArbitrageAction.NONE:
             await self._execute_decision(worker, decision, cid=cid)
         self._publish_dashboard(worker)

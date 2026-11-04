@@ -75,7 +75,7 @@ class DynamicArbitrageScenarioTests(unittest.TestCase):
         self.assertEqual(decision.action, ArbitrageAction.EMERGENCY_HEDGE)
         self.assertAlmostEqual(decision.projected_combined or 0, 1.0, places=2)
 
-    def test_average_down_lowers_combined_to_90c(self):
+    def test_paired_average_down_improves_combined(self):
         snap = InventorySnapshot(yes_shares=5, no_shares=5, yes_cost=2.75, no_cost=2.25)
         self.assertAlmostEqual(matched_combined_average(snap), 1.0)
         decision = evaluate_inventory_tick(
@@ -83,14 +83,65 @@ class DynamicArbitrageScenarioTests(unittest.TestCase):
             now=time.time(),
             hedge_deadline_at=0,
             first_leg_side="",
-            yes_exe=(0.75, 5.0),
-            no_exe=(0.25, 5.0),
+            yes_exe=(0.47, 5.0),
+            no_exe=(0.49, 5.0),
             cfg=self.cfg,
         )
         self.assertEqual(decision.action, ArbitrageAction.AVERAGE_DOWN)
-        self.assertEqual(decision.side, "NO")
-        after = snap.with_buy("NO", 5, 0.25)
-        self.assertAlmostEqual(matched_combined_average(after), 0.90, places=2)
+        self.assertTrue(decision.paired)
+        after = snap.with_buy("YES", 5, 0.47).with_buy("NO", 5, 0.49)
+        self.assertAlmostEqual(matched_combined_average(after), 0.98, places=2)
+
+    def test_skip_dca_when_target_already_achieved(self):
+        snap = InventorySnapshot(yes_shares=5, no_shares=5, yes_cost=2.40, no_cost=2.50)
+        self.assertAlmostEqual(matched_combined_average(snap), 0.98)
+        decision = evaluate_inventory_tick(
+            snap,
+            now=time.time(),
+            hedge_deadline_at=0,
+            first_leg_side="",
+            yes_exe=(0.40, 5.0),
+            no_exe=(0.40, 5.0),
+            cfg=self.cfg,
+            target_achieved=True,
+        )
+        self.assertEqual(decision.action, ArbitrageAction.NONE)
+
+    def test_endgame_rebalance_waives_combined_cap(self):
+        snap = InventorySnapshot(yes_shares=5, no_shares=10, yes_cost=2.75, no_cost=3.50)
+        cfg = ArbitrageConfig(
+            target_combined_cost=0.98,
+            max_combined_cost=0.98,
+            rebalance_max_combined_cost=1.0,
+            endgame_rebalance_seconds=90.0,
+            endgame_rebalance_max_combined_cost=1.03,
+            min_order_size=5.0,
+            max_slippage=0.0,
+            max_first_leg_price=0.92,
+        )
+        blocked = evaluate_inventory_tick(
+            snap,
+            now=time.time(),
+            hedge_deadline_at=0,
+            first_leg_side="",
+            yes_exe=(0.78, 5.0),
+            no_exe=(0.25, 5.0),
+            cfg=cfg,
+            seconds_to_close=300.0,
+        )
+        self.assertEqual(blocked.action, ArbitrageAction.NONE)
+        allowed = evaluate_inventory_tick(
+            snap,
+            now=time.time(),
+            hedge_deadline_at=0,
+            first_leg_side="",
+            yes_exe=(0.78, 5.0),
+            no_exe=(0.25, 5.0),
+            cfg=cfg,
+            seconds_to_close=60.0,
+        )
+        self.assertEqual(allowed.action, ArbitrageAction.REBALANCE)
+        self.assertEqual(allowed.side, "YES")
 
     def test_rebalance_five_up_ten_down_at_75c_up(self):
         snap = InventorySnapshot(yes_shares=5, no_shares=10, yes_cost=2.75, no_cost=3.50)

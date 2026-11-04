@@ -397,6 +397,7 @@ def plan_paired_buy(
     min_order_size: float,
     max_share_imbalance: float,
     balance_inventory_before_buy: bool,
+    max_shares_per_side: float = 0.0,
 ) -> PairedBuyPlan:
     """Plan equal YES+NO purchase when inventory is balanced."""
     req = max(0.0, float(requested_qty))
@@ -412,6 +413,7 @@ def plan_paired_buy(
         allow_unmatched_accumulation=True,
         purpose="paired_dca",
         allow_first_leg_entry=False,
+        max_shares_per_side=max_shares_per_side,
     )
     reject_no = plan_single_leg_buy(
         snap=snap,
@@ -425,6 +427,7 @@ def plan_paired_buy(
         allow_unmatched_accumulation=True,
         purpose="paired_dca",
         allow_first_leg_entry=False,
+        max_shares_per_side=max_shares_per_side,
     )
     if req <= _EPS:
         plan = reject_yes
@@ -469,6 +472,7 @@ def plan_paired_buy(
         balance_inventory_before_buy=False,
         allow_unmatched_accumulation=True,
         purpose="paired_dca",
+        max_shares_per_side=max_shares_per_side,
     )
     # Effective inventory after both legs (symmetric)
     eff2 = EffectiveInventory(
@@ -488,6 +492,7 @@ def plan_paired_buy(
         balance_inventory_before_buy=False,
         allow_unmatched_accumulation=True,
         purpose="paired_dca",
+        max_shares_per_side=max_shares_per_side,
     )
     if yes_p.approved_qty >= min_order_size - _EPS and no_p.approved_qty >= min_order_size - _EPS:
         return PairedBuyPlan(BuyApproval.APPROVED, req, "paired_approved", yes_p, no_p)

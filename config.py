@@ -225,6 +225,8 @@ class WorkerConfig:
     gabagool_inventory_soft_limit: float = 2.0
     gabagool_endgame_seconds: int = 30
     gabagool_endgame_max_unpaired: float = 1.0
+    endgame_rebalance_seconds: float = 90.0
+    endgame_rebalance_max_combined_cost: float = 1.03
     gabagool_falling_knife_enabled: bool = True
     gabagool_falling_knife_window_seconds: float = 3.0
     gabagool_falling_knife_min_drop: float = 0.035
@@ -712,6 +714,20 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _fatal(
             f"{asset}:{window}: gabagool_endgame_max_unpaired={gabagool_endgame_max_unpaired} "
             f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
+        )
+    endgame_rebalance_seconds = _parse_nonnegative_float(
+        "endgame_rebalance_seconds",
+        _cfg_get(raw, defaults, "endgame_rebalance_seconds", default=90.0),
+        float(defaults.get("endgame_rebalance_seconds", 90.0)),
+    )
+    endgame_rebalance_max_combined_cost = _parse_nonnegative_float(
+        "endgame_rebalance_max_combined_cost",
+        _cfg_get(raw, defaults, "endgame_rebalance_max_combined_cost", default=1.03),
+        float(defaults.get("endgame_rebalance_max_combined_cost", 1.03)),
+    )
+    if endgame_rebalance_max_combined_cost > 1.10:
+        _fatal(
+            f"{asset}:{window}: endgame_rebalance_max_combined_cost must be <= 1.10"
         )
     gabagool_falling_knife_enabled = _parse_bool_value(
         "gabagool_falling_knife_enabled",
@@ -1444,6 +1460,8 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_inventory_soft_limit=gabagool_inventory_soft_limit,
         gabagool_endgame_seconds=gabagool_endgame_seconds,
         gabagool_endgame_max_unpaired=gabagool_endgame_max_unpaired,
+        endgame_rebalance_seconds=endgame_rebalance_seconds,
+        endgame_rebalance_max_combined_cost=endgame_rebalance_max_combined_cost,
         gabagool_falling_knife_enabled=gabagool_falling_knife_enabled,
         gabagool_falling_knife_window_seconds=gabagool_falling_knife_window_seconds,
         gabagool_falling_knife_min_drop=gabagool_falling_knife_min_drop,
