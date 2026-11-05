@@ -271,19 +271,12 @@ class WorkerConfig:
     force_hedge_after_timeout: bool = False
     target_shares_per_side: float = 10.0
     momentum_lookback_5s: float = 5.0
-    momentum_lookback_15s: float = 15.0
-    momentum_lookback_30s: float = 30.0
-    momentum_threshold_5s: float = 0.01
-    momentum_threshold_15s: float = 0.02
-    momentum_threshold_30s: float = 0.03
-    momentum_confirmation_required: int = 2
-    stabilization_period_seconds: float = 2.0
+    momentum_entry_min_price: float = 0.65
     hedge_pending_timeout_seconds: float = 60.0
     max_combined_entry_cost: float = 0.97
     inventory_execution_type: str = "FAK"
     max_purchase_size: float = 10.0
     min_cost_improvement: float = 0.005
-    entry_max_chase_cents: float = 0.04
     max_consecutive_buys_per_outcome: int = 3
     stabilization_window_seconds: float = 15.0
     stabilization_tolerance_percent: float = 0.02
@@ -923,40 +916,10 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _cfg_get(raw, defaults, "momentum_lookback_5s", default=5.0),
         5.0,
     )
-    momentum_lookback_15s = _parse_nonnegative_float(
-        "momentum_lookback_15s",
-        _cfg_get(raw, defaults, "momentum_lookback_15s", default=15.0),
-        15.0,
-    )
-    momentum_lookback_30s = _parse_nonnegative_float(
-        "momentum_lookback_30s",
-        _cfg_get(raw, defaults, "momentum_lookback_30s", default=30.0),
-        30.0,
-    )
-    momentum_threshold_5s = _parse_nonnegative_float(
-        "momentum_threshold_5s",
-        _cfg_get(raw, defaults, "momentum_threshold_5s", default=0.01),
-        0.01,
-    )
-    momentum_threshold_15s = _parse_nonnegative_float(
-        "momentum_threshold_15s",
-        _cfg_get(raw, defaults, "momentum_threshold_15s", default=0.02),
-        0.02,
-    )
-    momentum_threshold_30s = _parse_nonnegative_float(
-        "momentum_threshold_30s",
-        _cfg_get(raw, defaults, "momentum_threshold_30s", default=0.03),
-        0.03,
-    )
-    momentum_confirmation_required = int(
-        _cfg_get(raw, defaults, "momentum_confirmation_required", default=2) or 2
-    )
-    if momentum_confirmation_required < 1 or momentum_confirmation_required > 3:
-        _fatal(f"{asset}:{window}: momentum_confirmation_required must be 1..3")
-    stabilization_period_seconds = _parse_nonnegative_float(
-        "stabilization_period_seconds",
-        _cfg_get(raw, defaults, "stabilization_period_seconds", default=2.0),
-        2.0,
+    momentum_entry_min_price = _parse_unit_fraction(
+        "momentum_entry_min_price",
+        _cfg_get(raw, defaults, "momentum_entry_min_price", default=0.65),
+        0.65,
     )
     hedge_pending_timeout_seconds = _parse_nonnegative_float(
         "hedge_pending_timeout_seconds",
@@ -994,11 +957,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         "min_cost_improvement",
         _cfg_get(raw, defaults, "min_cost_improvement", default=0.005),
         0.005,
-    )
-    entry_max_chase_cents = _parse_nonnegative_float(
-        "entry_max_chase_cents",
-        _cfg_get(raw, defaults, "entry_max_chase_cents", default=0.04),
-        0.04,
     )
     max_consecutive_buys_raw = _cfg_get(
         raw, defaults, "max_consecutive_buys_per_outcome", default=3,
@@ -1595,19 +1553,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         force_hedge_after_timeout=force_hedge_after_timeout,
         target_shares_per_side=target_shares_per_side,
         momentum_lookback_5s=momentum_lookback_5s,
-        momentum_lookback_15s=momentum_lookback_15s,
-        momentum_lookback_30s=momentum_lookback_30s,
-        momentum_threshold_5s=momentum_threshold_5s,
-        momentum_threshold_15s=momentum_threshold_15s,
-        momentum_threshold_30s=momentum_threshold_30s,
-        momentum_confirmation_required=momentum_confirmation_required,
-        stabilization_period_seconds=stabilization_period_seconds,
+        momentum_entry_min_price=momentum_entry_min_price,
         hedge_pending_timeout_seconds=hedge_pending_timeout_seconds,
         max_combined_entry_cost=max_combined_entry_cost,
         inventory_execution_type=inventory_execution_type,
         max_purchase_size=max_purchase_size,
         min_cost_improvement=min_cost_improvement,
-        entry_max_chase_cents=entry_max_chase_cents,
         max_consecutive_buys_per_outcome=max_consecutive_buys_per_outcome,
         stabilization_window_seconds=stabilization_window_seconds,
         stabilization_tolerance_percent=stabilization_tolerance_percent,

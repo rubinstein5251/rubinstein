@@ -2276,7 +2276,10 @@ function _renderInventoryStatusBar(bot) {
   const combinedC = Number(bot.matched_combined_cost_c || bot.pair_avg_price_c) || 0;
   const phase = String(bot.accumulation_phase || bot.strategy_state || '—').replace(/_/g, ' ');
   const next = String(bot.inventory_next_action || '—').replace(/_/g, ' ');
-  const momSide = bot.momentum_confirmed_side || '—';
+  const momSide = bot.momentum_side || bot.momentum_confirmed_side || '—';
+  const momAskC = Number(bot.momentum_side_ask_c) || 0;
+  const minEntryC = Number(bot.momentum_entry_min_price_c) || 65;
+  const entrySt = String(bot.inventory_entry_status || 'WAITING');
   const targetSh = Number(bot.target_shares_per_side) || 10;
   const upSh = Number(bot.up_shares ?? bot.yes_shares) || 0;
   const downSh = Number(bot.down_shares ?? bot.no_shares) || 0;
@@ -2288,7 +2291,9 @@ function _renderInventoryStatusBar(bot) {
     <span>Target pair <span class="text-orange-400">${targetC.toFixed(0)}¢</span></span>
     <span>Combined <span class="${combinedCls}">${combinedC > 0 ? combinedC.toFixed(1) + '¢' : '—'}</span></span>
     <span>UP/DOWN <span class="text-zinc-200">${upSh.toFixed(0)}/${targetSh} · ${downSh.toFixed(0)}/${targetSh}</span>${reached}</span>
-    <span>Momentum <span class="text-sky-300">${momSide}</span></span>
+    <span>Momentum <span class="text-sky-300">${momSide}</span> @ ${momAskC > 0 ? momAskC.toFixed(1) + '¢' : '—'}</span>
+    <span>Min entry <span class="text-orange-400">${minEntryC.toFixed(0)}¢</span></span>
+    <span>Entry <span class="text-zinc-200">${entrySt}</span></span>
     <span>Phase <span class="text-zinc-200">${phase}</span></span>
     <span>Next <span class="text-sky-300">${next}</span></span>
     <span>FAK <span class="text-zinc-300">${fak}</span></span>

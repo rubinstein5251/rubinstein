@@ -3000,7 +3000,7 @@ class MarketWorker:
         if wc.inventory_accumulation_enabled:
             hist_sec = max(
                 45.0,
-                float(getattr(wc, "momentum_lookback_30s", 30)) + 15.0,
+                float(getattr(wc, "momentum_lookback_5s", 5)) + 15.0,
             )
         cutoff = now - max(10.0, wc.gabagool_falling_knife_window_seconds * 3.0, hist_sec)
         while hist and hist[0][0] < cutoff:

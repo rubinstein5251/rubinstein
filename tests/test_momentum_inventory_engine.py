@@ -1,4 +1,4 @@
-"""Momentum-first inventory engine (paper / unit tests)."""
+"""Momentum-first inventory engine (simplified 65¢ entry)."""
 
 from __future__ import annotations
 
@@ -7,51 +7,29 @@ import unittest
 
 from utils.inventory_cost import InventorySnapshot
 from utils.momentum_inventory_engine import (
+    EntryStatus,
     InventoryBuyAction,
     InventoryPhase,
     MomentumInventoryConfig,
-    StabilizationPending,
     evaluate_momentum_inventory_tick,
 )
 from utils.order_book_momentum import evaluate_order_book_momentum
 
 
-def _hist(base: float, deltas: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Build (ts, price) series from (seconds_ago, price) pairs."""
-    now = 1000.0
-    points = [(now - sec, px) for sec, px in sorted(deltas, key=lambda x: -x[0])]
-    points.sort(key=lambda x: x[0])
-    return points
-
-
 class OrderBookMomentumTests(unittest.TestCase):
-    def test_yes_momentum_confirmed(self):
+    def test_yes_upward_momentum(self):
         now = 1000.0
-        yes = [
-            (now - 35, 0.50),
-            (now - 30, 0.50),
-            (now - 15, 0.52),
-            (now - 5, 0.53),
-            (now, 0.55),
-        ]
-        no = [
-            (now - 35, 0.48),
-            (now - 30, 0.48),
-            (now - 15, 0.46),
-            (now - 5, 0.44),
-            (now, 0.42),
-        ]
+        yes = [(now - 6, 0.50), (now, 0.55)]
+        no = [(now - 6, 0.45), (now, 0.44)]
         ev = evaluate_order_book_momentum(yes, no, now)
-        self.assertEqual(ev.confirmed_side, "YES")
-        self.assertFalse(ev.conflict)
+        self.assertEqual(ev.momentum_side, "YES")
 
-    def test_conflict_when_both_rise(self):
+    def test_no_momentum_when_flat(self):
         now = 1000.0
-        yes = [(now - 30, 0.50), (now - 15, 0.52), (now, 0.55)]
-        no = [(now - 30, 0.40), (now - 15, 0.42), (now, 0.44)]
+        yes = [(now - 6, 0.50), (now, 0.50)]
+        no = [(now - 6, 0.40), (now, 0.40)]
         ev = evaluate_order_book_momentum(yes, no, now)
-        self.assertIsNone(ev.confirmed_side)
-        self.assertTrue(ev.conflict)
+        self.assertIsNone(ev.momentum_side)
 
 
 class MomentumInventoryEngineTests(unittest.TestCase):
@@ -60,69 +38,52 @@ class MomentumInventoryEngineTests(unittest.TestCase):
             target_shares_per_side=10.0,
             min_order_size=5.0,
             max_purchase_size=10.0,
-            stabilization_period_seconds=2.0,
+            momentum_entry_min_price=0.65,
             max_combined_entry_cost=0.97,
             max_combined_cost=0.97,
             hedge_pending_timeout_seconds=60.0,
         )
         self.now = 2000.0
 
-    def test_entry_requires_stabilization(self):
+    def _rising_yes_hist(self):
+        return [
+            (self.now - 6, 0.60),
+            (self.now, 0.66),
+        ]
+
+    def test_waits_below_65c(self):
         snap = InventorySnapshot(0, 0, 0, 0)
-        yes = [
-            (self.now - 30, 0.52),
-            (self.now - 15, 0.53),
-            (self.now - 5, 0.54),
-            (self.now, 0.55),
-        ]
-        no = [
-            (self.now - 30, 0.45),
-            (self.now - 15, 0.44),
-            (self.now - 5, 0.41),
-            (self.now, 0.40),
-        ]
-        stab = StabilizationPending("YES", self.now - 0.5, evaluate_order_book_momentum(yes, no, self.now))
+        yes = [(self.now - 6, 0.60), (self.now, 0.64)]
+        no = [(self.now - 6, 0.35), (self.now, 0.34)]
         d = evaluate_momentum_inventory_tick(
             snap,
             now=self.now,
             yes_history=yes,
             no_history=no,
-            yes_exe=(0.55, 10.0),
-            no_exe=(0.40, 10.0),
+            yes_exe=(0.64, 10.0),
+            no_exe=(0.34, 10.0),
             cfg=self.cfg,
-            stabilization=stab,
         )
         self.assertEqual(d.action, InventoryBuyAction.NONE)
-        self.assertIn("stabilizing", d.reason)
+        self.assertEqual(d.reason, "momentum_side_below_min_entry")
+        self.assertEqual(d.entry_status, EntryStatus.WAITING.value)
 
-    def test_momentum_entry_after_stabilization(self):
+    def test_eligible_at_65c_or_above(self):
         snap = InventorySnapshot(0, 0, 0, 0)
-        yes = [
-            (self.now - 30, 0.52),
-            (self.now - 15, 0.53),
-            (self.now - 5, 0.54),
-            (self.now, 0.55),
-        ]
-        no = [
-            (self.now - 30, 0.45),
-            (self.now - 15, 0.44),
-            (self.now - 5, 0.41),
-            (self.now, 0.40),
-        ]
-        mom = evaluate_order_book_momentum(yes, no, self.now)
-        stab = StabilizationPending("YES", self.now - 3.0, mom)
+        yes = self._rising_yes_hist()
+        no = [(self.now - 6, 0.35), (self.now, 0.34)]
         d = evaluate_momentum_inventory_tick(
             snap,
             now=self.now,
             yes_history=yes,
             no_history=no,
-            yes_exe=(0.55, 10.0),
-            no_exe=(0.40, 10.0),
+            yes_exe=(0.66, 10.0),
+            no_exe=(0.30, 10.0),
             cfg=self.cfg,
-            stabilization=stab,
         )
         self.assertEqual(d.action, InventoryBuyAction.MOMENTUM_ENTRY)
         self.assertEqual(d.side, "YES")
+        self.assertEqual(d.entry_status, EntryStatus.ELIGIBLE.value)
 
     def test_no_emergency_hedge_after_timeout(self):
         snap = InventorySnapshot(10, 0, 5.5, 0)

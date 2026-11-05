@@ -17,13 +17,12 @@ from utils.inventory_strategy_store import (
     inventory_strategy_store,
 )
 from utils.momentum_inventory_engine import (
+    EntryStatus,
     InventoryBuyAction,
     InventoryPhase,
-    StabilizationPending,
     config_from_worker,
     evaluate_momentum_inventory_tick,
 )
-from utils.order_book_momentum import evaluate_order_book_momentum
 
 if TYPE_CHECKING:
     from bot import MarketWorker
@@ -32,14 +31,8 @@ _LOG = logging.getLogger("inventory_pair_accumulation")
 
 
 class InventoryPairAccumulationStrategy:
-    def __init__(self) -> None:
-        self._stabilization: dict[str, Optional[StabilizationPending]] = {}
-
     def _key(self, worker: "MarketWorker") -> str:
         return worker.worker_config.key
-
-    def _stab_key(self, worker: "MarketWorker", cid: str) -> str:
-        return f"{self._key(worker)}:{cid}"
 
     def _max_shares_per_side(self, worker: "MarketWorker") -> float:
         wc = worker.worker_config
@@ -178,6 +171,7 @@ class InventoryPairAccumulationStrategy:
                 return
             worker.order_state = OrderState.PENDING
             worker.dashboard["fak_order_status"] = "submitted"
+            worker.dashboard["inventory_entry_status"] = EntryStatus.EXECUTING.value
             qty_f, fill_px, oid = await fak_buy_limit(
                 worker, decision.side, limit_px, qty, purpose="momentum_inventory",
             )
@@ -185,7 +179,9 @@ class InventoryPairAccumulationStrategy:
             worker.dashboard["fak_order_status"] = "filled" if qty_f > 0 else "no_fill"
             if qty_f <= 0:
                 worker.dashboard["entry_block_reason"] = f"{decision.action.value}_fak_no_fill"
+                worker.dashboard["inventory_entry_status"] = EntryStatus.WAITING.value
                 return
+            worker.dashboard["inventory_entry_status"] = EntryStatus.FILLED.value
             await self._record_buy(
                 worker, decision.side, qty_f, fill_px, limit_px, oid, action=decision.action,
             )
@@ -204,34 +200,6 @@ class InventoryPairAccumulationStrategy:
                     }
                 )
             )
-
-    def _update_stabilization(
-        self,
-        worker: "MarketWorker",
-        cid: str,
-        decision,
-        now: float,
-    ) -> Optional[StabilizationPending]:
-        key = self._stab_key(worker, cid)
-        momentum = decision.momentum
-        if momentum and momentum.confirmed_side and decision.action == InventoryBuyAction.NONE:
-            if decision.reason == "awaiting_stabilization":
-                self._stabilization[key] = StabilizationPending(
-                    side=momentum.confirmed_side,
-                    signal_at=now,
-                    evaluation=momentum,
-                )
-            elif decision.reason.startswith("stabilizing"):
-                pending = self._stabilization.get(key)
-                if pending is None and momentum.confirmed_side:
-                    self._stabilization[key] = StabilizationPending(
-                        side=momentum.confirmed_side,
-                        signal_at=now - 0.01,
-                        evaluation=momentum,
-                    )
-        if decision.action == InventoryBuyAction.MOMENTUM_ENTRY:
-            self._stabilization[key] = None
-        return self._stabilization.get(key)
 
     def _publish_dashboard(self, worker: "MarketWorker", decision) -> None:
         wc = worker.worker_config
@@ -272,17 +240,24 @@ class InventoryPairAccumulationStrategy:
         worker.dashboard["hedge_timeout_reassess"] = decision.hedge_timeout_reassess
         worker.dashboard["max_combined_entry_cost_c"] = round(cfg.max_combined_entry_cost * 100, 2)
 
-        mom = decision.momentum
-        if mom:
-            worker.dashboard["momentum_confirmed_side"] = mom.confirmed_side or "—"
-            worker.dashboard["momentum_5s_c"] = round((mom.yes.delta_5s or 0) * 100, 2)
-            worker.dashboard["momentum_15s_c"] = round((mom.yes.delta_15s or 0) * 100, 2)
-            worker.dashboard["momentum_30s_c"] = round((mom.yes.delta_30s or 0) * 100, 2)
-            worker.dashboard["momentum_down_5s_c"] = round((mom.no.delta_5s or 0) * 100, 2)
-            worker.dashboard["momentum_down_15s_c"] = round((mom.no.delta_15s or 0) * 100, 2)
-            worker.dashboard["momentum_down_30s_c"] = round((mom.no.delta_30s or 0) * 100, 2)
-        filters = decision.entry_filters.as_dict()
-        worker.dashboard.update(filters)
+        min_entry_c = round(cfg.momentum_entry_min_price * 100, 1)
+        worker.dashboard["momentum_entry_min_price_c"] = min_entry_c
+        mom_side = decision.momentum_side or (
+            decision.momentum.momentum_side if decision.momentum else None
+        )
+        worker.dashboard["momentum_side"] = mom_side or "—"
+        worker.dashboard["momentum_confirmed_side"] = worker.dashboard["momentum_side"]
+        ask = decision.momentum_side_ask
+        if ask <= 0 and mom_side:
+            ask = float(worker.best_ask(mom_side))
+        worker.dashboard["momentum_side_ask_c"] = round(ask * 100, 2) if ask > 0 else 0.0
+        if worker.order_state.name == "PENDING":
+            entry_status = EntryStatus.EXECUTING.value
+        elif worker.dashboard.get("inventory_entry_status") == EntryStatus.FILLED.value:
+            entry_status = EntryStatus.FILLED.value
+        else:
+            entry_status = decision.entry_status
+        worker.dashboard["inventory_entry_status"] = entry_status
 
         cid = worker.canonical_market_id() or ""
         rec = inventory_strategy_store.cycle_for_market(self._key(worker), cid)
@@ -313,6 +288,7 @@ class InventoryPairAccumulationStrategy:
         if not cid or not worker.active_market:
             return
         if worker.order_state.name == "PENDING" or worker._order_lock.locked():
+            worker.dashboard["inventory_entry_status"] = EntryStatus.EXECUTING.value
             return
         if worker.market_seconds_left() <= worker.worker_config.min_time_before_close_seconds:
             worker.dashboard["entry_block_reason"] = "too_close_to_resolution"
@@ -348,33 +324,8 @@ class InventoryPairAccumulationStrategy:
         yes_exe = worker.executable_buy_partial("YES", size_probe, require_full_size=False)
         no_exe = worker.executable_buy_partial("NO", size_probe, require_full_size=False)
 
-        stab_key = self._stab_key(worker, cid)
         yes_hist = list(worker._ask_history.get("YES", []))
         no_hist = list(worker._ask_history.get("NO", []))
-
-        if snap.yes_shares <= 1e-9 and snap.no_shares <= 1e-9:
-            mom_only = evaluate_order_book_momentum(
-                yes_hist,
-                no_hist,
-                now,
-                lookback_5s=cfg.lookback_5s,
-                lookback_15s=cfg.lookback_15s,
-                lookback_30s=cfg.lookback_30s,
-                threshold_5s=cfg.threshold_5s,
-                threshold_15s=cfg.threshold_15s,
-                threshold_30s=cfg.threshold_30s,
-                confirmation_required=cfg.confirmation_required,
-            )
-            pending = self._stabilization.get(stab_key)
-            if mom_only.confirmed_side:
-                if pending is None or pending.side != mom_only.confirmed_side:
-                    self._stabilization[stab_key] = StabilizationPending(
-                        side=mom_only.confirmed_side,
-                        signal_at=now,
-                        evaluation=mom_only,
-                    )
-            else:
-                self._stabilization[stab_key] = None
 
         decision = evaluate_momentum_inventory_tick(
             snap,
@@ -385,10 +336,8 @@ class InventoryPairAccumulationStrategy:
             no_exe=no_exe,
             cfg=cfg,
             first_fill_at=first_fill_at,
-            stabilization=self._stabilization.get(stab_key),
         )
 
-        self._update_stabilization(worker, cid, decision, now)
         self._publish_dashboard(worker, decision)
 
         if decision.action != InventoryBuyAction.NONE:

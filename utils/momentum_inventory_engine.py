@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 from utils.inventory_cost import InventorySnapshot, matched_combined_average
 from utils.order_book_momentum import (
     OrderBookMomentumEvaluation,
     evaluate_order_book_momentum,
-    momentum_still_valid,
 )
 
 _EPS = 1e-9
@@ -35,17 +33,18 @@ class InventoryBuyAction(str, Enum):
     BALANCE = "balance"
 
 
+class EntryStatus(str, Enum):
+    WAITING = "WAITING"
+    ELIGIBLE = "ELIGIBLE"
+    EXECUTING = "EXECUTING"
+    FILLED = "FILLED"
+
+
 @dataclass(frozen=True)
 class MomentumInventoryConfig:
     target_shares_per_side: float = 10.0
-    lookback_5s: float = 5.0
-    lookback_15s: float = 15.0
-    lookback_30s: float = 30.0
-    threshold_5s: float = 0.01
-    threshold_15s: float = 0.02
-    threshold_30s: float = 0.03
-    confirmation_required: int = 2
-    stabilization_period_seconds: float = 2.0
+    momentum_lookback_seconds: float = 5.0
+    momentum_entry_min_price: float = 0.65
     hedge_pending_timeout_seconds: float = 60.0
     max_combined_entry_cost: float = 0.97
     max_combined_cost: float = 0.97
@@ -53,33 +52,7 @@ class MomentumInventoryConfig:
     min_order_size: float = 5.0
     max_purchase_size: float = 10.0
     min_cost_improvement: float = 0.005
-    entry_max_chase_cents: float = 0.04
     fee_rate: float = 0.0
-
-
-@dataclass
-class EntryFilterStatus:
-    momentum: bool = False
-    stabilization: bool = False
-    volatility: bool = False
-    combined_cost: bool = False
-    liquidity: bool = False
-
-    def as_dict(self) -> Dict[str, bool]:
-        return {
-            "filter_a_momentum": self.momentum,
-            "filter_b_stabilization": self.stabilization,
-            "filter_c_volatility": self.volatility,
-            "filter_d_combined_cost": self.combined_cost,
-            "filter_e_liquidity": self.liquidity,
-        }
-
-
-@dataclass
-class StabilizationPending:
-    side: str
-    signal_at: float
-    evaluation: OrderBookMomentumEvaluation
 
 
 @dataclass(frozen=True)
@@ -92,7 +65,9 @@ class InventoryTickDecision:
     reason: str
     projected_combined: Optional[float] = None
     momentum: Optional[OrderBookMomentumEvaluation] = None
-    entry_filters: EntryFilterStatus = field(default_factory=EntryFilterStatus)
+    entry_status: str = EntryStatus.WAITING.value
+    momentum_side: Optional[str] = None
+    momentum_side_ask: float = 0.0
     hedge_pending_elapsed: float = 0.0
     hedge_timeout_reassess: bool = False
 
@@ -133,7 +108,6 @@ def estimate_combined_acquisition(
     *,
     target: float,
 ) -> Optional[float]:
-    """Estimated pair cost if remaining shares fill at executable asks."""
     if yes_px <= 0 or no_px <= 0:
         return None
     rem_y = _remaining(snap, "YES", target)
@@ -152,14 +126,6 @@ def estimate_flat_entry_combined(yes_px: float, no_px: float) -> Optional[float]
     return yes_px + no_px
 
 
-def _volatility_ok(momentum: OrderBookMomentumEvaluation, side: str, cfg: MomentumInventoryConfig) -> bool:
-    sm = momentum.yes if side.upper() == "YES" else momentum.no
-    for d in (sm.delta_5s, sm.delta_15s, sm.delta_30s):
-        if d is not None and d > cfg.entry_max_chase_cents + _EPS:
-            return False
-    return True
-
-
 def _pick_qty(
     remaining: float,
     liq: float,
@@ -168,9 +134,7 @@ def _pick_qty(
     cap = min(cfg.max_purchase_size, remaining, liq)
     if cap < cfg.min_order_size - _EPS:
         return 0.0
-    if cap >= cfg.min_order_size - _EPS:
-        return cap
-    return 0.0
+    return cap
 
 
 def _projected_combined_after_buy(
@@ -208,33 +172,18 @@ def evaluate_momentum_inventory_tick(
     yes_exe: Optional[Tuple[float, float]],
     no_exe: Optional[Tuple[float, float]],
     cfg: MomentumInventoryConfig,
-    primary_side: str = "",
     first_fill_at: float = 0.0,
-    stabilization: Optional[StabilizationPending] = None,
 ) -> InventoryTickDecision:
     target = cfg.target_shares_per_side
     y_px, y_liq = _exe(yes_exe)
     n_px, n_liq = _exe(no_exe)
     phase = _phase_for(snap, target, first_fill_at)
-    empty_filters = EntryFilterStatus()
-
-    if phase == InventoryPhase.TARGET_REACHED:
-        return InventoryTickDecision(
-            InventoryBuyAction.NONE, phase, "", 0.0, 0.0, "target_reached",
-            matched_combined_average(snap),
-        )
 
     momentum = evaluate_order_book_momentum(
         yes_history,
         no_history,
         now,
-        lookback_5s=cfg.lookback_5s,
-        lookback_15s=cfg.lookback_15s,
-        lookback_30s=cfg.lookback_30s,
-        threshold_5s=cfg.threshold_5s,
-        threshold_15s=cfg.threshold_15s,
-        threshold_30s=cfg.threshold_30s,
-        confirmation_required=cfg.confirmation_required,
+        lookback_sec=cfg.momentum_lookback_seconds,
     )
 
     hedge_elapsed = max(0.0, now - first_fill_at) if first_fill_at > 0 else 0.0
@@ -243,7 +192,13 @@ def evaluate_momentum_inventory_tick(
         and hedge_elapsed >= cfg.hedge_pending_timeout_seconds - _EPS
     )
 
-    # ── Balanced partial inventory: cost optimize + top-up toward target ──
+    if phase == InventoryPhase.TARGET_REACHED:
+        return InventoryTickDecision(
+            InventoryBuyAction.NONE, phase, "", 0.0, 0.0, "target_reached",
+            matched_combined_average(snap), momentum,
+            entry_status=EntryStatus.FILLED.value,
+        )
+
     if phase in (
         InventoryPhase.STATE_3_COST_OPTIMIZATION,
         InventoryPhase.STATE_4_INVENTORY_BALANCING,
@@ -279,15 +234,9 @@ def evaluate_momentum_inventory_tick(
                 "favorable_fill",
                 _proj,
                 momentum,
-                EntryFilterStatus(
-                    momentum=True,
-                    stabilization=True,
-                    volatility=True,
-                    combined_cost=True,
-                    liquidity=True,
-                ),
-                hedge_elapsed,
-                hedge_reassess,
+                entry_status=EntryStatus.WAITING.value,
+                hedge_pending_elapsed=hedge_elapsed,
+                hedge_timeout_reassess=hedge_reassess,
             )
         reason = "hedge_timeout_reassess_no_acceptable_price" if hedge_reassess else "waiting_favorable_price"
         return InventoryTickDecision(
@@ -297,7 +246,6 @@ def evaluate_momentum_inventory_tick(
             hedge_timeout_reassess=hedge_reassess,
         )
 
-    # ── Single-leg exposure: complete primary or hedge opposite ──
     if phase == InventoryPhase.STATE_2_HEDGE_PENDING:
         primary = "YES" if snap.yes_shares > snap.no_shares else "NO"
         opposite = "NO" if primary == "YES" else "YES"
@@ -305,7 +253,6 @@ def evaluate_momentum_inventory_tick(
         pri_px, pri_liq = (y_px, y_liq) if primary == "YES" else (n_px, n_liq)
         pri_rem = _remaining(snap, primary, target)
 
-        # Still building momentum leg toward target when price acceptable
         if pri_rem > _EPS and pri_px > 0:
             qty = _pick_qty(pri_rem, pri_liq, cfg)
             proj = _projected_combined_after_buy(snap, primary, qty, pri_px)
@@ -324,9 +271,8 @@ def evaluate_momentum_inventory_tick(
                     "continue_primary_leg",
                     proj,
                     momentum,
-                    EntryFilterStatus(True, True, True, True, True),
-                    hedge_elapsed,
-                    hedge_reassess,
+                    hedge_pending_elapsed=hedge_elapsed,
+                    hedge_timeout_reassess=hedge_reassess,
                 )
 
         opp_rem = _remaining(snap, opposite, target)
@@ -343,9 +289,8 @@ def evaluate_momentum_inventory_tick(
                     "opposite_at_acceptable_cost",
                     proj,
                     momentum,
-                    EntryFilterStatus(True, True, True, True, True),
-                    hedge_elapsed,
-                    hedge_reassess,
+                    hedge_pending_elapsed=hedge_elapsed,
+                    hedge_timeout_reassess=hedge_reassess,
                 )
         reason = "hedge_timeout_reassess_no_acceptable_price" if hedge_reassess else "waiting_opposite_price"
         return InventoryTickDecision(
@@ -355,83 +300,64 @@ def evaluate_momentum_inventory_tick(
             hedge_timeout_reassess=hedge_reassess,
         )
 
-    # ── Flat book: momentum-first entry ──
-    filters = EntryFilterStatus()
-    if not momentum.confirmed_side:
-        filters.momentum = False
+    # ── Flat book: momentum side + min 65¢ executable ask ──
+    mom_side = momentum.momentum_side
+    mom_ask = y_px if mom_side == "YES" else n_px if mom_side == "NO" else 0.0
+    if not mom_side:
         return InventoryTickDecision(
             InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            momentum.reason, None, momentum, filters,
-        )
-    side = momentum.confirmed_side
-    filters.momentum = True
-
-    if not _volatility_ok(momentum, side, cfg):
-        filters.volatility = False
-        return InventoryTickDecision(
-            InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            "excessive_volatility", None, momentum, filters,
-        )
-    filters.volatility = True
-
-    pending = stabilization
-    if pending is None or pending.side != side:
-        return InventoryTickDecision(
-            InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            "awaiting_stabilization",
-            None, momentum, EntryFilterStatus(True, False, True, False, False),
+            momentum.reason, None, momentum,
+            entry_status=EntryStatus.WAITING.value,
+            momentum_side=None,
+            momentum_side_ask=mom_ask,
         )
 
-    elapsed = now - pending.signal_at
-    if elapsed < cfg.stabilization_period_seconds - _EPS:
+    px, liq = (y_px, y_liq) if mom_side == "YES" else (n_px, n_liq)
+    if px < cfg.momentum_entry_min_price - _EPS:
         return InventoryTickDecision(
             InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            f"stabilizing_{elapsed:.1f}s",
+            "momentum_side_below_min_entry",
             None, momentum,
-            EntryFilterStatus(True, False, True, False, False),
+            entry_status=EntryStatus.WAITING.value,
+            momentum_side=mom_side,
+            momentum_side_ask=px,
         )
 
-    if not momentum_still_valid(momentum, side, confirmation_required=cfg.confirmation_required):
-        return InventoryTickDecision(
-            InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            "stabilization_signal_lost",
-            None, momentum,
-            EntryFilterStatus(True, False, True, False, False),
-        )
-    filters.stabilization = True
-
-    px, liq = (y_px, y_liq) if side == "YES" else (n_px, n_liq)
     flat_combined = estimate_flat_entry_combined(y_px, n_px)
     if flat_combined is not None and flat_combined > cfg.max_combined_entry_cost + _EPS:
-        filters.combined_cost = False
         return InventoryTickDecision(
             InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
             "combined_entry_cost_too_high",
-            flat_combined, momentum, filters,
+            flat_combined, momentum,
+            entry_status=EntryStatus.WAITING.value,
+            momentum_side=mom_side,
+            momentum_side_ask=px,
         )
-    filters.combined_cost = True
 
-    rem = _remaining(snap, side, target)
+    rem = _remaining(snap, mom_side, target)
     qty = _pick_qty(rem, liq, cfg)
     if qty < cfg.min_order_size - _EPS or px <= 0:
-        filters.liquidity = False
         return InventoryTickDecision(
             InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
             "insufficient_liquidity",
-            flat_combined, momentum, filters,
+            flat_combined, momentum,
+            entry_status=EntryStatus.WAITING.value,
+            momentum_side=mom_side,
+            momentum_side_ask=px,
         )
-    filters.liquidity = True
 
     return InventoryTickDecision(
         InventoryBuyAction.MOMENTUM_ENTRY,
         InventoryPhase.STATE_1_INITIAL_MOMENTUM,
-        side,
+        mom_side,
         qty,
         px + cfg.max_slippage,
-        "momentum_entry_ready",
+        "momentum_entry_eligible",
         flat_combined,
         momentum,
-        filters,
+        entry_status=EntryStatus.ELIGIBLE.value,
+        momentum_side=mom_side,
+        momentum_side_ask=px,
     )
 
 
@@ -444,14 +370,8 @@ def config_from_worker(wc) -> MomentumInventoryConfig:
     )
     return MomentumInventoryConfig(
         target_shares_per_side=target,
-        lookback_5s=float(getattr(wc, "momentum_lookback_5s", 5)),
-        lookback_15s=float(getattr(wc, "momentum_lookback_15s", 15)),
-        lookback_30s=float(getattr(wc, "momentum_lookback_30s", 30)),
-        threshold_5s=float(getattr(wc, "momentum_threshold_5s", 0.01)),
-        threshold_15s=float(getattr(wc, "momentum_threshold_15s", 0.02)),
-        threshold_30s=float(getattr(wc, "momentum_threshold_30s", 0.03)),
-        confirmation_required=int(getattr(wc, "momentum_confirmation_required", 2)),
-        stabilization_period_seconds=float(getattr(wc, "stabilization_period_seconds", 2.0)),
+        momentum_lookback_seconds=float(getattr(wc, "momentum_lookback_5s", 5.0)),
+        momentum_entry_min_price=float(getattr(wc, "momentum_entry_min_price", 0.65)),
         hedge_pending_timeout_seconds=float(
             getattr(wc, "hedge_pending_timeout_seconds", 0)
             or wc.initial_hedge_timeout_seconds
@@ -462,6 +382,5 @@ def config_from_worker(wc) -> MomentumInventoryConfig:
         min_order_size=float(wc.min_order_size),
         max_purchase_size=float(getattr(wc, "max_purchase_size", 0) or wc.max_order_size or target),
         min_cost_improvement=float(getattr(wc, "min_cost_improvement", 0.005)),
-        entry_max_chase_cents=float(getattr(wc, "entry_max_chase_cents", 0.04)),
         fee_rate=float(wc.spread_capture_fee_rate),
     )
