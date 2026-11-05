@@ -43,7 +43,7 @@ def display_strategy_state(raw: str, *, stopped_out: bool, has_position: bool) -
         "state_2_hedge_pending": "HEDGE PENDING",
         "state_3_cost_optimization": "COST OPTIMIZATION",
         "state_4_inventory_balancing": "INVENTORY BALANCING",
-        "target_reached": "TARGET REACHED (10/10)",
+        "target_reached": "TARGET REACHED (5/5)",
         "momentum_entry": "MOMENTUM ENTRY (FAK)",
         "accumulate_primary": "ACCUMULATING MOMENTUM LEG",
         "accumulate_opposite": "ACCUMULATING OPPOSITE LEG",
@@ -82,7 +82,7 @@ def enrich_dashboard_payload(d: Mapping[str, Any]) -> dict[str, Any]:
         or float(out.get("no_shares") or 0) > 0
     )
     if out.get("inventory_accumulation_enabled"):
-        out["strategy_name"] = out.get("strategy_name") or "Momentum inventory 10/10"
+        out["strategy_name"] = out.get("strategy_name") or "Momentum inventory 5/5"
         out["strategy_label"] = out.get("strategy_label") or "Momentum-first inventory"
         if not out.get("execution_type") or out.get("execution_type") == "FOK":
             out["execution_type"] = str(out.get("inventory_execution_type") or "FAK").upper()

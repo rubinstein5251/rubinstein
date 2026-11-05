@@ -2272,7 +2272,7 @@ function _fmtUsdCompact(v) {
 }
 
 function _renderInventoryStatusBar(bot) {
-  const targetC = Number(bot.max_combined_entry_cost_c || bot.target_combined_pair_cost_c) || 97;
+  const targetC = Number(bot.target_combined_pair_cost_c || bot.matched_combined_cost_c) || 93;
   const combinedC = Number(bot.matched_combined_cost_c || bot.pair_avg_price_c) || 0;
   const phase = String(bot.accumulation_phase || bot.strategy_state || '—').replace(/_/g, ' ');
   const next = String(bot.inventory_next_action || '—').replace(/_/g, ' ');
@@ -2280,13 +2280,13 @@ function _renderInventoryStatusBar(bot) {
   const momAskC = Number(bot.momentum_side_ask_c) || 0;
   const minEntryC = Number(bot.momentum_entry_min_price_c) || 65;
   const entrySt = String(bot.inventory_entry_status || 'WAITING');
-  const targetSh = Number(bot.target_shares_per_side) || 10;
+  const targetSh = Number(bot.target_shares_per_side) || 5;
   const upSh = Number(bot.up_shares ?? bot.yes_shares) || 0;
   const downSh = Number(bot.down_shares ?? bot.no_shares) || 0;
   const fak = String(bot.fak_order_status || '—');
   const hedgeSec = bot.hedge_pending_elapsed_s != null ? `${Number(bot.hedge_pending_elapsed_s).toFixed(0)}s` : '—';
   const combinedCls = combinedC > 0 && combinedC <= targetC + 0.5 ? 'text-accent' : combinedC > targetC ? 'text-yellow-400' : 'text-zinc-300';
-  const reached = bot.target_reached ? ' <span class="text-emerald-400">10/10</span>' : '';
+  const reached = bot.target_reached ? ' <span class="text-emerald-400">5/5</span>' : '';
   return `<div class="text-xs text-zinc-400 font-mono flex flex-wrap gap-x-3 gap-y-1">
     <span>Target pair <span class="text-orange-400">${targetC.toFixed(0)}¢</span></span>
     <span>Combined <span class="${combinedCls}">${combinedC > 0 ? combinedC.toFixed(1) + '¢' : '—'}</span></span>
@@ -2358,10 +2358,7 @@ function _renderInventoryDetailGrid(bot) {
   const matched = Number(bot.matched_pairs) || 0;
   const reason = String(bot.inventory_action_reason || bot.entry_block_reason || '').trim();
   return `<div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-sm font-mono">
-    <div class="text-xs text-zinc-500 uppercase tracking-wide mb-2">Pair entry fills</div>
-    ${_renderPairLegBlock('First leg fill', 'Ideal / emergency hedge', bot.first_leg_fill || bot.hedge_fills, 'hedge')}
-    ${_renderPairLegBlock('Second leg fill', 'DCA price fills', bot.second_leg_fill || bot.dca_fills, 'dca')}
-    <div class="text-xs text-zinc-500 uppercase tracking-wide mt-3 mb-2">Inventory legs (total)</div>
+    <div class="text-xs text-zinc-500 uppercase tracking-wide mb-2">Inventory legs (total)</div>
     ${_fmtLegSpend(bot, 'YES')}
     ${_fmtLegSpend(bot, 'NO')}
     <div class="border-t border-zinc-700/80 mt-2 pt-2 space-y-1 text-xs">

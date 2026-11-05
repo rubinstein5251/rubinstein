@@ -36,7 +36,12 @@ class InventoryPairAccumulationStrategy:
 
     def _max_shares_per_side(self, worker: "MarketWorker") -> float:
         wc = worker.worker_config
-        return float(getattr(wc, "target_shares_per_side", 0) or wc.max_shares or wc.max_position_size)
+        return float(
+            getattr(wc, "target_shares_per_side", 0)
+            or getattr(wc, "max_shares_per_side", 0)
+            or wc.max_shares
+            or wc.max_position_size
+        )
 
     def _purpose_for_action(self, action: InventoryBuyAction) -> str:
         if action == InventoryBuyAction.MOMENTUM_ENTRY:
@@ -211,7 +216,7 @@ class InventoryPairAccumulationStrategy:
         combined = matched_combined_average(snap)
         target = cfg.target_shares_per_side
         worker.dashboard["strategy_mode"] = "momentum_inventory_accumulation"
-        worker.dashboard["strategy_name"] = "Momentum inventory 10/10"
+        worker.dashboard["strategy_name"] = "Momentum inventory 5/5"
         worker.dashboard["strategy_label"] = "Momentum-first inventory"
         worker.dashboard["execution_type"] = str(
             getattr(wc, "inventory_execution_type", "FAK") or "FAK"
@@ -238,7 +243,13 @@ class InventoryPairAccumulationStrategy:
         worker.dashboard["inventory_action_reason"] = decision.reason
         worker.dashboard["hedge_pending_elapsed_s"] = round(decision.hedge_pending_elapsed, 1)
         worker.dashboard["hedge_timeout_reassess"] = decision.hedge_timeout_reassess
-        worker.dashboard["max_combined_entry_cost_c"] = round(cfg.max_combined_entry_cost * 100, 2)
+        worker.dashboard["target_combined_pair_cost_c"] = round(
+            cfg.target_combined_pair_cost * 100, 2,
+        )
+        if decision.max_opposite_price is not None:
+            worker.dashboard["max_opposite_price_c"] = round(
+                decision.max_opposite_price * 100, 2,
+            )
 
         min_entry_c = round(cfg.momentum_entry_min_price * 100, 1)
         worker.dashboard["momentum_entry_min_price_c"] = min_entry_c

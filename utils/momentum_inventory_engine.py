@@ -1,4 +1,4 @@
-"""Momentum-first 10/10 inventory accumulation (pure decisions, no I/O)."""
+"""Momentum-first 5/5 inventory accumulation (pure decisions, no I/O)."""
 
 from __future__ import annotations
 
@@ -42,15 +42,15 @@ class EntryStatus(str, Enum):
 
 @dataclass(frozen=True)
 class MomentumInventoryConfig:
-    target_shares_per_side: float = 10.0
+    target_shares_per_side: float = 5.0
     momentum_lookback_seconds: float = 5.0
     momentum_entry_min_price: float = 0.65
     hedge_pending_timeout_seconds: float = 60.0
-    max_combined_entry_cost: float = 0.97
-    max_combined_cost: float = 0.97
+    target_combined_pair_cost: float = 0.93
     max_slippage: float = 0.005
+    slippage_reserve: float = 0.0
     min_order_size: float = 5.0
-    max_purchase_size: float = 10.0
+    max_purchase_size: float = 5.0
     min_cost_improvement: float = 0.005
     fee_rate: float = 0.0
 
@@ -68,6 +68,7 @@ class InventoryTickDecision:
     entry_status: str = EntryStatus.WAITING.value
     momentum_side: Optional[str] = None
     momentum_side_ask: float = 0.0
+    max_opposite_price: Optional[float] = None
     hedge_pending_elapsed: float = 0.0
     hedge_timeout_reassess: bool = False
 
@@ -101,29 +102,47 @@ def _phase_for(snap: InventorySnapshot, target: float, first_fill_at: float) -> 
     return InventoryPhase.TARGET_REACHED
 
 
-def estimate_combined_acquisition(
+def max_acceptable_opposite_price(
     snap: InventorySnapshot,
-    yes_px: float,
-    no_px: float,
-    *,
-    target: float,
+    primary_side: str,
+    target_combined: float,
 ) -> Optional[float]:
-    if yes_px <= 0 or no_px <= 0:
-        return None
-    rem_y = _remaining(snap, "YES", target)
-    rem_n = _remaining(snap, "NO", target)
-    proj = snap
-    if rem_y > _EPS:
-        proj = proj.with_buy("YES", rem_y, yes_px)
-    if rem_n > _EPS:
-        proj = proj.with_buy("NO", rem_n, no_px)
-    return matched_combined_average(proj)
+    """Required opposite ask ceiling: target combined minus primary average fill price."""
+    primary = primary_side.upper()
+    if primary == "YES":
+        if snap.yes_shares <= _EPS:
+            return None
+        avg = snap.yes_avg()
+    else:
+        if snap.no_shares <= _EPS:
+            return None
+        avg = snap.no_avg()
+    return float(target_combined) - avg
 
 
-def estimate_flat_entry_combined(yes_px: float, no_px: float) -> Optional[float]:
-    if yes_px <= 0 or no_px <= 0:
-        return None
-    return yes_px + no_px
+def _projected_combined_after_buy(
+    snap: InventorySnapshot,
+    side: str,
+    qty: float,
+    px: float,
+) -> Optional[float]:
+    after = snap.with_buy(side, qty, px)
+    return matched_combined_average(after)
+
+
+def _meets_target_combined(
+    snap: InventorySnapshot,
+    side: str,
+    qty: float,
+    px: float,
+    cfg: MomentumInventoryConfig,
+) -> bool:
+    after = snap.with_buy(side, qty, px)
+    combined = matched_combined_average(after)
+    if combined is None:
+        return False
+    cap = cfg.target_combined_pair_cost + cfg.slippage_reserve + _EPS
+    return combined <= cap
 
 
 def _pick_qty(
@@ -135,16 +154,6 @@ def _pick_qty(
     if cap < cfg.min_order_size - _EPS:
         return 0.0
     return cap
-
-
-def _projected_combined_after_buy(
-    snap: InventorySnapshot,
-    side: str,
-    qty: float,
-    px: float,
-) -> Optional[float]:
-    after = snap.with_buy(side, qty, px)
-    return matched_combined_average(after)
 
 
 def _buy_improves_cost(
@@ -159,8 +168,25 @@ def _buy_improves_cost(
     if after is None:
         return current is None
     if current is None:
-        return after <= cfg.max_combined_cost + _EPS
-    return after <= current - cfg.min_cost_improvement + _EPS or after <= cfg.max_combined_cost + _EPS
+        return after <= cfg.target_combined_pair_cost + _EPS
+    return (
+        after <= current - cfg.min_cost_improvement + _EPS
+        or after <= cfg.target_combined_pair_cost + _EPS
+    )
+
+
+def _primary_side(snap: InventorySnapshot) -> str:
+    if snap.yes_shares > snap.no_shares + _EPS:
+        return "YES"
+    if snap.no_shares > snap.yes_shares + _EPS:
+        return "NO"
+    return "YES" if snap.yes_shares >= snap.no_shares else "NO"
+
+
+def _unpaired_on(snap: InventorySnapshot, side: str) -> float:
+    if side.upper() == "YES":
+        return snap.unpaired_yes
+    return snap.unpaired_no
 
 
 def evaluate_momentum_inventory_tick(
@@ -211,11 +237,11 @@ def evaluate_momentum_inventory_tick(
             qty = _pick_qty(rem, liq, cfg)
             if qty <= 0 or px <= 0:
                 continue
-            proj = _projected_combined_after_buy(snap, side, qty, px)
-            if proj is not None and proj > cfg.max_combined_cost + _EPS:
+            if not _meets_target_combined(snap, side, qty, px, cfg):
                 continue
             if not _buy_improves_cost(snap, side, qty, px, cfg):
                 continue
+            proj = _projected_combined_after_buy(snap, side, qty, px)
             action = (
                 InventoryBuyAction.BALANCE
                 if phase == InventoryPhase.STATE_4_INVENTORY_BALANCING
@@ -247,21 +273,17 @@ def evaluate_momentum_inventory_tick(
         )
 
     if phase == InventoryPhase.STATE_2_HEDGE_PENDING:
-        primary = "YES" if snap.yes_shares > snap.no_shares else "NO"
+        primary = _primary_side(snap)
         opposite = "NO" if primary == "YES" else "YES"
         opp_px, opp_liq = (n_px, n_liq) if opposite == "NO" else (y_px, y_liq)
         pri_px, pri_liq = (y_px, y_liq) if primary == "YES" else (n_px, n_liq)
         pri_rem = _remaining(snap, primary, target)
+        max_opp = max_acceptable_opposite_price(snap, primary, cfg.target_combined_pair_cost)
 
-        if pri_rem > _EPS and pri_px > 0:
+        if pri_rem > _EPS and pri_px > 0 and pri_px >= cfg.momentum_entry_min_price - _EPS:
             qty = _pick_qty(pri_rem, pri_liq, cfg)
-            proj = _projected_combined_after_buy(snap, primary, qty, pri_px)
-            est = estimate_combined_acquisition(snap, y_px, n_px, target=target)
-            if (
-                qty >= cfg.min_order_size - _EPS
-                and (est is None or est <= cfg.max_combined_entry_cost + _EPS)
-                and (proj is None or proj <= cfg.max_combined_cost + _EPS)
-            ):
+            if qty >= cfg.min_order_size - _EPS:
+                proj = _projected_combined_after_buy(snap, primary, qty, pri_px)
                 return InventoryTickDecision(
                     InventoryBuyAction.ACCUMULATE_PRIMARY,
                     phase,
@@ -276,31 +298,41 @@ def evaluate_momentum_inventory_tick(
                 )
 
         opp_rem = _remaining(snap, opposite, target)
-        qty = _pick_qty(min(opp_rem, snap.yes_shares if primary == "YES" else snap.no_shares), opp_liq, cfg)
-        if qty >= cfg.min_order_size - _EPS and opp_px > 0:
+        pair_cap = _unpaired_on(snap, primary)
+        qty = _pick_qty(min(opp_rem, pair_cap), opp_liq, cfg)
+        if (
+            qty >= cfg.min_order_size - _EPS
+            and opp_px > 0
+            and max_opp is not None
+            and opp_px <= max_opp + cfg.max_slippage + _EPS
+            and _meets_target_combined(snap, opposite, qty, opp_px, cfg)
+        ):
             proj = _projected_combined_after_buy(snap, opposite, qty, opp_px)
-            if proj is not None and proj <= cfg.max_combined_cost + _EPS:
-                return InventoryTickDecision(
-                    InventoryBuyAction.ACCUMULATE_OPPOSITE,
-                    phase,
-                    opposite,
-                    qty,
-                    opp_px + cfg.max_slippage,
-                    "opposite_at_acceptable_cost",
-                    proj,
-                    momentum,
-                    hedge_pending_elapsed=hedge_elapsed,
-                    hedge_timeout_reassess=hedge_reassess,
-                )
-        reason = "hedge_timeout_reassess_no_acceptable_price" if hedge_reassess else "waiting_opposite_price"
+            return InventoryTickDecision(
+                InventoryBuyAction.ACCUMULATE_OPPOSITE,
+                phase,
+                opposite,
+                qty,
+                min(opp_px + cfg.max_slippage, max_opp + cfg.max_slippage),
+                "opposite_at_target_combined",
+                proj,
+                momentum,
+                max_opposite_price=max_opp,
+                hedge_pending_elapsed=hedge_elapsed,
+                hedge_timeout_reassess=hedge_reassess,
+            )
+        reason = "hedge_timeout_reassess_no_acceptable_price" if hedge_reassess else "waiting_opposite_target_price"
+        if max_opp is not None and opp_px > max_opp + cfg.max_slippage + _EPS:
+            reason = f"opposite_above_max_{max_opp:.2f}_ask_{opp_px:.2f}"
         return InventoryTickDecision(
             InventoryBuyAction.NONE, phase, "", 0.0, 0.0, reason,
             matched_combined_average(snap), momentum,
+            max_opposite_price=max_opp,
             hedge_pending_elapsed=hedge_elapsed,
             hedge_timeout_reassess=hedge_reassess,
         )
 
-    # ── Flat book: momentum side + min 65¢ executable ask ──
+    # ── Flat book: UP or DOWN momentum side, min 65¢ executable ask ──
     mom_side = momentum.momentum_side
     mom_ask = y_px if mom_side == "YES" else n_px if mom_side == "NO" else 0.0
     if not mom_side:
@@ -323,24 +355,13 @@ def evaluate_momentum_inventory_tick(
             momentum_side_ask=px,
         )
 
-    flat_combined = estimate_flat_entry_combined(y_px, n_px)
-    if flat_combined is not None and flat_combined > cfg.max_combined_entry_cost + _EPS:
-        return InventoryTickDecision(
-            InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
-            "combined_entry_cost_too_high",
-            flat_combined, momentum,
-            entry_status=EntryStatus.WAITING.value,
-            momentum_side=mom_side,
-            momentum_side_ask=px,
-        )
-
     rem = _remaining(snap, mom_side, target)
     qty = _pick_qty(rem, liq, cfg)
     if qty < cfg.min_order_size - _EPS or px <= 0:
         return InventoryTickDecision(
             InventoryBuyAction.NONE, InventoryPhase.IDLE, "", 0.0, 0.0,
             "insufficient_liquidity",
-            flat_combined, momentum,
+            None, momentum,
             entry_status=EntryStatus.WAITING.value,
             momentum_side=mom_side,
             momentum_side_ask=px,
@@ -353,7 +374,7 @@ def evaluate_momentum_inventory_tick(
         qty,
         px + cfg.max_slippage,
         "momentum_entry_eligible",
-        flat_combined,
+        None,
         momentum,
         entry_status=EntryStatus.ELIGIBLE.value,
         momentum_side=mom_side,
@@ -362,9 +383,15 @@ def evaluate_momentum_inventory_tick(
 
 
 def config_from_worker(wc) -> MomentumInventoryConfig:
-    target = float(getattr(wc, "target_shares_per_side", 0) or wc.max_shares or wc.max_position_size)
-    max_entry = float(
-        getattr(wc, "max_combined_entry_cost", 0)
+    target = float(
+        getattr(wc, "target_shares_per_side", 0)
+        or getattr(wc, "max_shares_per_side", 0)
+        or wc.max_shares
+        or wc.max_position_size
+    )
+    target_combined = float(
+        wc.target_combined_pair_cost
+        or wc.combined_cost_target
         or wc.max_combined_pair_cost
         or wc.max_combined_cost
     )
@@ -376,11 +403,13 @@ def config_from_worker(wc) -> MomentumInventoryConfig:
             getattr(wc, "hedge_pending_timeout_seconds", 0)
             or wc.initial_hedge_timeout_seconds
         ),
-        max_combined_entry_cost=max_entry,
-        max_combined_cost=float(wc.max_combined_pair_cost or wc.max_combined_cost),
+        target_combined_pair_cost=target_combined,
         max_slippage=float(wc.max_slippage),
+        slippage_reserve=float(wc.spread_capture_slippage_buffer),
         min_order_size=float(wc.min_order_size),
-        max_purchase_size=float(getattr(wc, "max_purchase_size", 0) or wc.max_order_size or target),
+        max_purchase_size=float(
+            getattr(wc, "max_purchase_size", 0) or wc.max_order_size or target
+        ),
         min_cost_improvement=float(getattr(wc, "min_cost_improvement", 0.005)),
         fee_rate=float(wc.spread_capture_fee_rate),
     )

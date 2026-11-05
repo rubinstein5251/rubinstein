@@ -269,13 +269,14 @@ class WorkerConfig:
     inventory_max_active_orders: int = 4
     min_net_profit_per_pair: float = 0.02
     force_hedge_after_timeout: bool = False
-    target_shares_per_side: float = 10.0
+    target_shares_per_side: float = 5.0
+    max_shares_per_side: float = 5.0
+    max_combined_inventory: float = 10.0
     momentum_lookback_5s: float = 5.0
     momentum_entry_min_price: float = 0.65
     hedge_pending_timeout_seconds: float = 60.0
-    max_combined_entry_cost: float = 0.97
     inventory_execution_type: str = "FAK"
-    max_purchase_size: float = 10.0
+    max_purchase_size: float = 5.0
     min_cost_improvement: float = 0.005
     max_consecutive_buys_per_outcome: int = 3
     stabilization_window_seconds: float = 15.0
@@ -908,8 +909,23 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     )
     target_shares_per_side = _parse_order_size(
         "target_shares_per_side",
-        _cfg_get(raw, defaults, "target_shares_per_side", "max_shares", default=10.0),
-        float(defaults.get("target_shares_per_side", 10.0)),
+        _cfg_get(raw, defaults, "target_shares_per_side", "max_shares_per_side", "max_shares", default=5.0),
+        float(defaults.get("target_shares_per_side", 5.0)),
+    )
+    max_shares_per_side = _parse_order_size(
+        "max_shares_per_side",
+        _cfg_get(raw, defaults, "max_shares_per_side", "target_shares_per_side", "max_shares", default=target_shares_per_side),
+        float(target_shares_per_side),
+    )
+    if max_shares_per_side > target_shares_per_side + 1e-9:
+        _fatal(
+            f"{asset}:{window}: max_shares_per_side={max_shares_per_side} "
+            f"cannot exceed target_shares_per_side={target_shares_per_side}"
+        )
+    max_combined_inventory = _parse_order_size(
+        "max_combined_inventory",
+        _cfg_get(raw, defaults, "max_combined_inventory", default=target_shares_per_side * 2),
+        float(target_shares_per_side * 2),
     )
     momentum_lookback_5s = _parse_nonnegative_float(
         "momentum_lookback_5s",
@@ -931,17 +947,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             default=60.0,
         ),
         60.0,
-    )
-    max_combined_entry_cost = _parse_unit_fraction(
-        "max_combined_entry_cost",
-        _cfg_get(
-            raw,
-            defaults,
-            "max_combined_entry_cost",
-            "max_combined_pair_cost",
-            default=0.97,
-        ),
-        0.97,
     )
     inventory_execution_type = str(
         _cfg_get(raw, defaults, "inventory_execution_type", "execution_type", default="FAK")
@@ -1552,10 +1557,11 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         min_net_profit_per_pair=min_net_profit_per_pair,
         force_hedge_after_timeout=force_hedge_after_timeout,
         target_shares_per_side=target_shares_per_side,
+        max_shares_per_side=max_shares_per_side,
+        max_combined_inventory=max_combined_inventory,
         momentum_lookback_5s=momentum_lookback_5s,
         momentum_entry_min_price=momentum_entry_min_price,
         hedge_pending_timeout_seconds=hedge_pending_timeout_seconds,
-        max_combined_entry_cost=max_combined_entry_cost,
         inventory_execution_type=inventory_execution_type,
         max_purchase_size=max_purchase_size,
         min_cost_improvement=min_cost_improvement,
