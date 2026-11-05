@@ -1,0 +1,3 @@
+2026-11-05 03:48:58,827 {"event": "trade", "ts": 1793846938.8277907, "mode": "[DRY]", "action": "BUY", "side": "YES", "price": 0.93, "size": 10.0, "order_id": "dry-run", "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET", "window": "5m"}
+2026-11-05 03:48:59,376 {"event": "trade", "ts": 1793846939.3762655, "mode": "[DRY]", "action": "BUY", "side": "NO", "price": 0.01, "size": 10.0, "order_id": "dry-run", "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET", "window": "5m"}
+2026-11-05 03:50:08,934 {"event": "trade", "ts": 1793847008.93415, "mode": "[DRY]", "action": "redeem", "side": "YES", "price": 1.0, "size": 10.0, "order_id": null, "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET", "window": "5m"}

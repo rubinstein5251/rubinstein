@@ -92,6 +92,106 @@ async def fok_buy_limit(
     return 0.0, 0.0, order_id
 
 
+async def _simulate_fak_buy(worker: "MarketWorker", side: str, limit: float, size: float):
+    from bot import MIN_FILL_DELTA
+
+    worker.refresh_order_book(side)
+    cached = worker._book_cache.get(side)
+    if cached:
+        from utils.order_book_math import executable_buy_from_asks
+
+        book = cached[1]
+        asks = book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)
+        levels = []
+        if asks:
+            for row in asks:
+                try:
+                    if hasattr(row, "price"):
+                        px, sz = float(row.price), float(row.size)
+                    elif isinstance(row, dict):
+                        px, sz = float(row["price"]), float(row["size"])
+                    else:
+                        px, sz = float(row[0]), float(row[1])
+                except (TypeError, ValueError, KeyError, IndexError):
+                    continue
+                if px > 1.0:
+                    px /= 100.0
+                if px <= limit + 1e-9 and sz > 0:
+                    levels.append((px, sz))
+        if levels:
+            cost = 0.0
+            filled = 0.0
+            for px, avail in sorted(levels, key=lambda x: x[0]):
+                take = min(avail, size - filled)
+                if take <= 0:
+                    break
+                cost += take * px
+                filled += take
+                if filled >= size - 1e-9:
+                    break
+            if filled > MIN_FILL_DELTA:
+                return filled, cost / filled
+    exe = worker.executable_buy_partial(side, size)
+    if exe and exe[0] <= limit + 1e-9 and exe[1] > MIN_FILL_DELTA:
+        return min(exe[1], size), exe[0]
+    return 0.0, 0.0
+
+
+async def fak_buy_limit(
+    worker: "MarketWorker",
+    side: str,
+    limit_price: float,
+    size: float,
+    *,
+    purpose: str,
+) -> Tuple[float, float, Optional[str]]:
+    """Fill-and-Kill buy: accept partial fills; never leave resting size."""
+    from bot import MIN_FILL_DELTA
+
+    limit = clamp_buy_price(limit_price)
+    if purpose in (
+        "pair_accumulation",
+        "momentum_inventory",
+        "inventory_rebalance",
+        "inventory_dca",
+        "inventory_balance",
+    ):
+        if limit <= 0 or limit > 1.0:
+            raise ValueError(f"invalid inventory buy limit {limit:.4f} ({purpose})")
+    if worker.is_dry_run():
+        qty, px = await _simulate_fak_buy(worker, side, limit, size)
+        return qty, px, "dry-run" if qty > MIN_FILL_DELTA else None
+
+    placed = await worker.place_strategy_fak_buy(side, limit, size, purpose=purpose)
+    order_id, immediate = placed[0], placed[1]
+    if not order_id:
+        return 0.0, 0.0, None
+    if immediate and immediate > MIN_FILL_DELTA:
+        worker._untrack_order(order_id)
+        fill_px = await worker.resolve_fill_price(order_id, size, limit)
+        return float(immediate), fill_px, order_id
+
+    cfg = worker.worker_config
+    timeout_sec = min(2.0, max(0.2, cfg.fill_timeout_ms / 1000.0))
+    poll_sec = max(0.05, cfg.fill_poll_ms / 1000.0)
+    started = time.monotonic()
+    cumulative = 0.0
+    fill_price = limit
+    while time.monotonic() - started < timeout_sec:
+        cumulative, fill_price = await worker.poll_order_fill(order_id, size, limit)
+        if cumulative > MIN_FILL_DELTA:
+            break
+        await asyncio.sleep(poll_sec)
+    try:
+        cumulative, fill_price = await worker.cancel_order_confirmed(order_id, size, limit)
+    except TimeoutError:
+        pass
+    worker._untrack_order(order_id)
+    if cumulative > MIN_FILL_DELTA:
+        return cumulative, fill_price, order_id
+    return 0.0, 0.0, order_id
+
+
 async def _simulate_fok_sell(
     worker: "MarketWorker",
     side: str,

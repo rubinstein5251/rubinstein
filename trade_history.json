@@ -1,1 +1,41 @@
-{}
+[
+  {
+    "id": "btc:btc-updown-5m-1793846700:buy:YES:1793850538000:0.93:10.0",
+    "timestamp": "2026-11-05 03:48:58",
+    "timestamp_ms": 1793850538000,
+    "asset": "BTC",
+    "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET",
+    "slug": "btc-updown-5m-1793846700",
+    "action": "buy",
+    "side": "YES",
+    "price": 0.93,
+    "size": 10.0,
+    "window": "5m"
+  },
+  {
+    "id": "btc:btc-updown-5m-1793846700:buy:NO:1793850539000:0.01:10.0",
+    "timestamp": "2026-11-05 03:48:59",
+    "timestamp_ms": 1793850539000,
+    "asset": "BTC",
+    "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET",
+    "slug": "btc-updown-5m-1793846700",
+    "action": "buy",
+    "side": "NO",
+    "price": 0.01,
+    "size": 10.0,
+    "window": "5m"
+  },
+  {
+    "id": "btc:btc-updown-5m-1793846700:redeem:YES:1793850608000:1.0:10.0",
+    "timestamp": "2026-11-05 03:50:08",
+    "timestamp_ms": 1793850608000,
+    "asset": "BTC",
+    "market": "Bitcoin Up or Down - November 4, 9:45PM-9:50PM ET",
+    "slug": "btc-updown-5m-1793846700",
+    "action": "redeem",
+    "side": "YES",
+    "price": 1.0,
+    "size": 10.0,
+    "window": "5m"
+  }
+]

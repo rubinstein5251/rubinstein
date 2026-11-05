@@ -2876,16 +2876,33 @@ class MarketWorker:
 
     def executable_buy(self, side: str, size: float) -> Optional[Tuple[float, float]]:
         """Volume-weighted ask walk for ``size`` shares (full size required)."""
+        return self.executable_buy_partial(side, size, require_full_size=True)
+
+    def executable_buy_partial(
+        self,
+        side: str,
+        size: float,
+        *,
+        require_full_size: bool = False,
+    ) -> Optional[Tuple[float, float]]:
+        """Volume-weighted ask walk; partial fills allowed when require_full_size=False."""
         self.refresh_order_book(side)
         cached = self._book_cache.get(side)
         if cached:
             book = cached[1]
             asks = book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)
-            exe = executable_buy_from_asks(asks, size, require_full_size=True)
+            exe = executable_buy_from_asks(
+                asks, size, require_full_size=require_full_size,
+            )
             if exe:
                 return exe
         ask = float(self.best_ask(side))
-        return best_level_fallback(side, ask, size, self.best_ask_size(side))
+        fb = best_level_fallback(side, ask, size, self.best_ask_size(side))
+        if fb and not require_full_size:
+            return fb
+        if fb and require_full_size and fb[1] >= size - 1e-6:
+            return fb
+        return None if require_full_size else fb
 
     def executable_sell(self, side: str, size: float) -> Optional[Tuple[float, float]]:
         self.refresh_order_book(side)
@@ -2978,7 +2995,14 @@ class MarketWorker:
         self._knife_low[side] = price if low <= 0 else min(low, price)
         # Keep enough recent data for the configured windows but do not let a
         # long-lived market accumulate stale observations.
-        cutoff = now - max(10.0, self.worker_config.gabagool_falling_knife_window_seconds * 3.0)
+        wc = self.worker_config
+        hist_sec = 45.0
+        if wc.inventory_accumulation_enabled:
+            hist_sec = max(
+                45.0,
+                float(getattr(wc, "momentum_lookback_30s", 30)) + 15.0,
+            )
+        cutoff = now - max(10.0, wc.gabagool_falling_knife_window_seconds * 3.0, hist_sec)
         while hist and hist[0][0] < cutoff:
             hist.popleft()
 
@@ -3375,6 +3399,32 @@ class MarketWorker:
         if filled and order_id:
             self._untrack_order(order_id)
             return order_id, float(size)
+        return order_id, 0.0
+
+    async def place_strategy_fak_buy(
+        self, side: str, price: float, size: float, *, purpose: str = "momentum_inventory",
+    ) -> Tuple[Optional[str], float]:
+        if not self.validate_order_size(side, float(size)):
+            exec_log("strategy_buy_blocked", side=side, reason="invalid_size", purpose=purpose)
+            return None, 0.0
+        wc = self.worker_config
+        if float(size) < wc.min_order_size - 1e-9:
+            return None, 0.0
+        ot = str(getattr(wc, "inventory_execution_type", "") or wc.order_type or "FAK").upper()
+        if ot not in ("FAK", "FOK"):
+            ot = "FAK"
+        ok, order_id, filled = await self.place_order_raw(
+            side, price, size, order_type=ot, action="BUY",
+            _strategy_buy_authorized=True,
+            _inventory_accumulation_authorized=True,
+        )
+        if not ok:
+            return None, 0.0
+        if order_id:
+            self._track_order(order_id, side, float(size), price)
+        if filled and order_id:
+            self._untrack_order(order_id)
+            return order_id, float(filled) if filled else float(size)
         return order_id, 0.0
 
     place_accumulation_fok = place_strategy_fok_buy

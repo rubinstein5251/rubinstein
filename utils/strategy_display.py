@@ -39,6 +39,16 @@ def display_strategy_state(raw: str, *, stopped_out: bool, has_position: bool) -
         "emergency_hedge": "EMERGENCY HEDGE",
         "average_down": "AVERAGING DOWN",
         "rebalance": "REBALANCING PAIRS",
+        "state_1_initial_momentum": "MOMENTUM ACCUMULATION",
+        "state_2_hedge_pending": "HEDGE PENDING",
+        "state_3_cost_optimization": "COST OPTIMIZATION",
+        "state_4_inventory_balancing": "INVENTORY BALANCING",
+        "target_reached": "TARGET REACHED (10/10)",
+        "momentum_entry": "MOMENTUM ENTRY (FAK)",
+        "accumulate_primary": "ACCUMULATING MOMENTUM LEG",
+        "accumulate_opposite": "ACCUMULATING OPPOSITE LEG",
+        "cost_optimize": "COST OPTIMIZATION BUY",
+        "balance": "BALANCE INVENTORY",
     }
     return mapping.get(key, key.replace("_", " ").upper())
 
@@ -64,7 +74,7 @@ def enrich_dashboard_payload(d: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(d)
     out["strategy_name"] = out.get("strategy_name") or "BTC/ETH Momentum"
     out["strategy_label"] = out.get("strategy_label") or "BTC/ETH Momentum"
-    out["execution_type"] = "FOK"
+    out["execution_type"] = str(out.get("execution_type") or "FOK").upper()
     stopped = bool(out.get("market_stopped_out"))
     has_pos = (
         float(out.get("position_size") or 0) > 0
@@ -72,8 +82,10 @@ def enrich_dashboard_payload(d: Mapping[str, Any]) -> dict[str, Any]:
         or float(out.get("no_shares") or 0) > 0
     )
     if out.get("inventory_accumulation_enabled"):
-        out["strategy_name"] = out.get("strategy_name") or "Pair accumulation"
-        out["strategy_label"] = out.get("strategy_label") or "Inventory accumulation"
+        out["strategy_name"] = out.get("strategy_name") or "Momentum inventory 10/10"
+        out["strategy_label"] = out.get("strategy_label") or "Momentum-first inventory"
+        if not out.get("execution_type") or out.get("execution_type") == "FOK":
+            out["execution_type"] = str(out.get("inventory_execution_type") or "FAK").upper()
     raw = str(out.get("strategy_state") or "idle")
     out["strategy_display_state"] = display_strategy_state(
         raw, stopped_out=stopped, has_position=has_pos,

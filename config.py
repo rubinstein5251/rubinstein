@@ -225,8 +225,6 @@ class WorkerConfig:
     gabagool_inventory_soft_limit: float = 2.0
     gabagool_endgame_seconds: int = 30
     gabagool_endgame_max_unpaired: float = 1.0
-    endgame_rebalance_seconds: float = 90.0
-    endgame_rebalance_max_combined_cost: float = 1.03
     gabagool_falling_knife_enabled: bool = True
     gabagool_falling_knife_window_seconds: float = 3.0
     gabagool_falling_knife_min_drop: float = 0.035
@@ -271,6 +269,21 @@ class WorkerConfig:
     inventory_max_active_orders: int = 4
     min_net_profit_per_pair: float = 0.02
     force_hedge_after_timeout: bool = False
+    target_shares_per_side: float = 10.0
+    momentum_lookback_5s: float = 5.0
+    momentum_lookback_15s: float = 15.0
+    momentum_lookback_30s: float = 30.0
+    momentum_threshold_5s: float = 0.01
+    momentum_threshold_15s: float = 0.02
+    momentum_threshold_30s: float = 0.03
+    momentum_confirmation_required: int = 2
+    stabilization_period_seconds: float = 2.0
+    hedge_pending_timeout_seconds: float = 60.0
+    max_combined_entry_cost: float = 0.97
+    inventory_execution_type: str = "FAK"
+    max_purchase_size: float = 10.0
+    min_cost_improvement: float = 0.005
+    entry_max_chase_cents: float = 0.04
     max_consecutive_buys_per_outcome: int = 3
     stabilization_window_seconds: float = 15.0
     stabilization_tolerance_percent: float = 0.02
@@ -537,17 +550,22 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         4.0,
     )
 
-    order_type = str(
-        os.getenv("ORDER_TYPE", _cfg_get(raw, defaults, "order_type", default="FOK"))
-    ).strip().upper()
-    if order_type != "FOK":
-        _fatal(f"ORDER_TYPE must be FOK (got {order_type!r})")
-
     inventory_accumulation_enabled = _parse_bool_value(
         "inventory_accumulation_enabled",
         _cfg_get(raw, defaults, "inventory_accumulation_enabled", default=True),
         True,
     )
+
+    order_type = str(
+        os.getenv("ORDER_TYPE", _cfg_get(raw, defaults, "order_type", default="FOK"))
+    ).strip().upper()
+    allowed_order_types = {"FOK"}
+    if inventory_accumulation_enabled:
+        allowed_order_types.add("FAK")
+    if order_type not in allowed_order_types:
+        _fatal(
+            f"ORDER_TYPE must be one of {sorted(allowed_order_types)!r} (got {order_type!r})"
+        )
     late_entry_enabled = False
     entry_price_threshold = cheap_entry_price
     max_slippage = _parse_nonnegative_float(
@@ -714,20 +732,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _fatal(
             f"{asset}:{window}: gabagool_endgame_max_unpaired={gabagool_endgame_max_unpaired} "
             f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
-        )
-    endgame_rebalance_seconds = _parse_nonnegative_float(
-        "endgame_rebalance_seconds",
-        _cfg_get(raw, defaults, "endgame_rebalance_seconds", default=90.0),
-        float(defaults.get("endgame_rebalance_seconds", 90.0)),
-    )
-    endgame_rebalance_max_combined_cost = _parse_nonnegative_float(
-        "endgame_rebalance_max_combined_cost",
-        _cfg_get(raw, defaults, "endgame_rebalance_max_combined_cost", default=1.03),
-        float(defaults.get("endgame_rebalance_max_combined_cost", 1.03)),
-    )
-    if endgame_rebalance_max_combined_cost > 1.10:
-        _fatal(
-            f"{asset}:{window}: endgame_rebalance_max_combined_cost must be <= 1.10"
         )
     gabagool_falling_knife_enabled = _parse_bool_value(
         "gabagool_falling_knife_enabled",
@@ -908,6 +912,93 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             _cfg_get(raw, defaults, "force_hedge_after_timeout", default=False),
         ),
         False,
+    )
+    target_shares_per_side = _parse_order_size(
+        "target_shares_per_side",
+        _cfg_get(raw, defaults, "target_shares_per_side", "max_shares", default=10.0),
+        float(defaults.get("target_shares_per_side", 10.0)),
+    )
+    momentum_lookback_5s = _parse_nonnegative_float(
+        "momentum_lookback_5s",
+        _cfg_get(raw, defaults, "momentum_lookback_5s", default=5.0),
+        5.0,
+    )
+    momentum_lookback_15s = _parse_nonnegative_float(
+        "momentum_lookback_15s",
+        _cfg_get(raw, defaults, "momentum_lookback_15s", default=15.0),
+        15.0,
+    )
+    momentum_lookback_30s = _parse_nonnegative_float(
+        "momentum_lookback_30s",
+        _cfg_get(raw, defaults, "momentum_lookback_30s", default=30.0),
+        30.0,
+    )
+    momentum_threshold_5s = _parse_nonnegative_float(
+        "momentum_threshold_5s",
+        _cfg_get(raw, defaults, "momentum_threshold_5s", default=0.01),
+        0.01,
+    )
+    momentum_threshold_15s = _parse_nonnegative_float(
+        "momentum_threshold_15s",
+        _cfg_get(raw, defaults, "momentum_threshold_15s", default=0.02),
+        0.02,
+    )
+    momentum_threshold_30s = _parse_nonnegative_float(
+        "momentum_threshold_30s",
+        _cfg_get(raw, defaults, "momentum_threshold_30s", default=0.03),
+        0.03,
+    )
+    momentum_confirmation_required = int(
+        _cfg_get(raw, defaults, "momentum_confirmation_required", default=2) or 2
+    )
+    if momentum_confirmation_required < 1 or momentum_confirmation_required > 3:
+        _fatal(f"{asset}:{window}: momentum_confirmation_required must be 1..3")
+    stabilization_period_seconds = _parse_nonnegative_float(
+        "stabilization_period_seconds",
+        _cfg_get(raw, defaults, "stabilization_period_seconds", default=2.0),
+        2.0,
+    )
+    hedge_pending_timeout_seconds = _parse_nonnegative_float(
+        "hedge_pending_timeout_seconds",
+        _cfg_get(
+            raw,
+            defaults,
+            "hedge_pending_timeout_seconds",
+            "initial_hedge_timeout_seconds",
+            default=60.0,
+        ),
+        60.0,
+    )
+    max_combined_entry_cost = _parse_unit_fraction(
+        "max_combined_entry_cost",
+        _cfg_get(
+            raw,
+            defaults,
+            "max_combined_entry_cost",
+            "max_combined_pair_cost",
+            default=0.97,
+        ),
+        0.97,
+    )
+    inventory_execution_type = str(
+        _cfg_get(raw, defaults, "inventory_execution_type", "execution_type", default="FAK")
+    ).strip().upper()
+    if inventory_execution_type not in ("FAK", "FOK"):
+        _fatal(f"{asset}:{window}: inventory_execution_type must be FAK or FOK")
+    max_purchase_size = _parse_order_size(
+        "max_purchase_size",
+        _cfg_get(raw, defaults, "max_purchase_size", "max_order_size", default=10.0),
+        float(defaults.get("max_purchase_size", 10.0)),
+    )
+    min_cost_improvement = _parse_nonnegative_float(
+        "min_cost_improvement",
+        _cfg_get(raw, defaults, "min_cost_improvement", default=0.005),
+        0.005,
+    )
+    entry_max_chase_cents = _parse_nonnegative_float(
+        "entry_max_chase_cents",
+        _cfg_get(raw, defaults, "entry_max_chase_cents", default=0.04),
+        0.04,
     )
     max_consecutive_buys_raw = _cfg_get(
         raw, defaults, "max_consecutive_buys_per_outcome", default=3,
@@ -1460,8 +1551,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_inventory_soft_limit=gabagool_inventory_soft_limit,
         gabagool_endgame_seconds=gabagool_endgame_seconds,
         gabagool_endgame_max_unpaired=gabagool_endgame_max_unpaired,
-        endgame_rebalance_seconds=endgame_rebalance_seconds,
-        endgame_rebalance_max_combined_cost=endgame_rebalance_max_combined_cost,
         gabagool_falling_knife_enabled=gabagool_falling_knife_enabled,
         gabagool_falling_knife_window_seconds=gabagool_falling_knife_window_seconds,
         gabagool_falling_knife_min_drop=gabagool_falling_knife_min_drop,
@@ -1504,6 +1593,21 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         inventory_max_active_orders=inventory_max_active_orders,
         min_net_profit_per_pair=min_net_profit_per_pair,
         force_hedge_after_timeout=force_hedge_after_timeout,
+        target_shares_per_side=target_shares_per_side,
+        momentum_lookback_5s=momentum_lookback_5s,
+        momentum_lookback_15s=momentum_lookback_15s,
+        momentum_lookback_30s=momentum_lookback_30s,
+        momentum_threshold_5s=momentum_threshold_5s,
+        momentum_threshold_15s=momentum_threshold_15s,
+        momentum_threshold_30s=momentum_threshold_30s,
+        momentum_confirmation_required=momentum_confirmation_required,
+        stabilization_period_seconds=stabilization_period_seconds,
+        hedge_pending_timeout_seconds=hedge_pending_timeout_seconds,
+        max_combined_entry_cost=max_combined_entry_cost,
+        inventory_execution_type=inventory_execution_type,
+        max_purchase_size=max_purchase_size,
+        min_cost_improvement=min_cost_improvement,
+        entry_max_chase_cents=entry_max_chase_cents,
         max_consecutive_buys_per_outcome=max_consecutive_buys_per_outcome,
         stabilization_window_seconds=stabilization_window_seconds,
         stabilization_tolerance_percent=stabilization_tolerance_percent,

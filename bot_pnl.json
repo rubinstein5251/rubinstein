@@ -1,1 +1,28 @@
-{}
+{
+  "total_pnl": 0.6,
+  "realized_pnl": 0.6,
+  "unrealized_pnl_note": "per-worker via dashboard API",
+  "fees_paid": 0.0,
+  "wins": 1,
+  "losses": 0,
+  "win_rate": "100.0%",
+  "total_trades": 1,
+  "last_updated": "2026-11-05 03:51:55",
+  "assets": {
+    "BTC_5M": {
+      "wins": 1,
+      "losses": 0,
+      "total_trades": 1,
+      "pnl": 0.6,
+      "win_rate": 100.0
+    },
+    "ETH_5M": {
+      "wins": 0,
+      "losses": 0,
+      "total_trades": 0,
+      "pnl": 0.0,
+      "win_rate": 0.0
+    }
+  },
+  "source": "canonical_ledger"
+}

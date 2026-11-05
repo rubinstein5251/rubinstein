@@ -2272,16 +2272,27 @@ function _fmtUsdCompact(v) {
 }
 
 function _renderInventoryStatusBar(bot) {
-  const targetC = Number(bot.target_combined_pair_cost_c) || 98;
+  const targetC = Number(bot.max_combined_entry_cost_c || bot.target_combined_pair_cost_c) || 97;
   const combinedC = Number(bot.matched_combined_cost_c || bot.pair_avg_price_c) || 0;
   const phase = String(bot.accumulation_phase || bot.strategy_state || '—').replace(/_/g, ' ');
   const next = String(bot.inventory_next_action || '—').replace(/_/g, ' ');
+  const momSide = bot.momentum_confirmed_side || '—';
+  const targetSh = Number(bot.target_shares_per_side) || 10;
+  const upSh = Number(bot.up_shares ?? bot.yes_shares) || 0;
+  const downSh = Number(bot.down_shares ?? bot.no_shares) || 0;
+  const fak = String(bot.fak_order_status || '—');
+  const hedgeSec = bot.hedge_pending_elapsed_s != null ? `${Number(bot.hedge_pending_elapsed_s).toFixed(0)}s` : '—';
   const combinedCls = combinedC > 0 && combinedC <= targetC + 0.5 ? 'text-accent' : combinedC > targetC ? 'text-yellow-400' : 'text-zinc-300';
+  const reached = bot.target_reached ? ' <span class="text-emerald-400">10/10</span>' : '';
   return `<div class="text-xs text-zinc-400 font-mono flex flex-wrap gap-x-3 gap-y-1">
     <span>Target pair <span class="text-orange-400">${targetC.toFixed(0)}¢</span></span>
     <span>Combined <span class="${combinedCls}">${combinedC > 0 ? combinedC.toFixed(1) + '¢' : '—'}</span></span>
+    <span>UP/DOWN <span class="text-zinc-200">${upSh.toFixed(0)}/${targetSh} · ${downSh.toFixed(0)}/${targetSh}</span>${reached}</span>
+    <span>Momentum <span class="text-sky-300">${momSide}</span></span>
     <span>Phase <span class="text-zinc-200">${phase}</span></span>
     <span>Next <span class="text-sky-300">${next}</span></span>
+    <span>FAK <span class="text-zinc-300">${fak}</span></span>
+    <span>Hedge timer <span class="text-zinc-300">${hedgeSec}</span></span>
   </div>`;
 }
 

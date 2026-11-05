@@ -11,8 +11,8 @@ from typing import Optional, Tuple
 from utils.inventory_cost import (
     InventorySnapshot,
     PurchaseDecision,
+    evaluate_dca_purchase,
     evaluate_initial_hedge,
-    evaluate_paired_dca_purchase,
     evaluate_rebalance_purchase,
     matched_combined_average,
     pick_cheap_side,
@@ -37,9 +37,6 @@ class ArbitrageDecision:
     limit_price: float
     reason: str
     projected_combined: Optional[float] = None
-    paired: bool = False
-    yes_limit_price: float = 0.0
-    no_limit_price: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -56,8 +53,6 @@ class ArbitrageConfig:
     min_order_size: float = 5.0
     fee_rate: float = 0.0
     hedge_timeout_seconds: float = 4.0
-    endgame_rebalance_seconds: float = 90.0
-    endgame_rebalance_max_combined_cost: float = 1.03
 
 
 def _exact_max_opposite_price(primary_avg: float, target_combined: float) -> float:
@@ -80,8 +75,6 @@ def evaluate_inventory_tick(
     yes_exe: Optional[Tuple[float, float]],
     no_exe: Optional[Tuple[float, float]],
     cfg: ArbitrageConfig,
-    seconds_to_close: Optional[float] = None,
-    target_achieved: bool = False,
 ) -> ArbitrageDecision:
     """Return the highest-priority buy action for this tick (no execution)."""
     y_px, y_liq = _exe_tuple(yes_exe)
@@ -149,16 +142,6 @@ def evaluate_inventory_tick(
             )
         return ArbitrageDecision(ArbitrageAction.NONE, "", 0.0, 0.0, "emergency_hedge_blocked")
 
-    in_endgame = (
-        seconds_to_close is not None
-        and seconds_to_close <= cfg.endgame_rebalance_seconds + _EPS
-    )
-    rebalance_cap = (
-        cfg.endgame_rebalance_max_combined_cost
-        if in_endgame
-        else cfg.rebalance_max_combined_cost
-    )
-
     # ── 2) Share imbalance: rebalance lagging leg (combined must stay <= $1) ──
     if unmatched_yes > _EPS or unmatched_no > _EPS:
         if unmatched_yes > unmatched_no:
@@ -168,14 +151,13 @@ def evaluate_inventory_tick(
         lag_px, lag_liq = (n_px, n_liq) if lagging == "NO" else (y_px, y_liq)
         qty = min(order_size, gap, lag_liq)
         if qty >= cfg.min_order_size - _EPS and lag_px > 0:
-            rebalance_min_profit = -1.0 if in_endgame else 0.0
             ev = evaluate_rebalance_purchase(
                 snap,
                 lagging,
                 qty,
                 lag_px,
-                max_combined_cost=rebalance_cap,
-                min_net_profit_per_pair=rebalance_min_profit,
+                max_combined_cost=cfg.rebalance_max_combined_cost,
+                min_net_profit_per_pair=0.0,
                 slippage_reserve=cfg.slippage_reserve,
             )
             if ev.decision == PurchaseDecision.BUY:
@@ -189,37 +171,42 @@ def evaluate_inventory_tick(
                 )
         return ArbitrageDecision(ArbitrageAction.NONE, "", 0.0, 0.0, "rebalance_not_eligible")
 
-    # ── 3) Balanced inventory: paired average-down (both legs, no skew) ──
+    # ── 3) Balanced inventory: average down on cheaper leg ──
     if snap.matched_pairs >= cfg.min_order_size - _EPS:
-        at_target = target_achieved or (
-            combined is not None and combined <= cfg.target_combined_cost + _EPS
-        )
-        if not at_target and y_px > 0 and n_px > 0:
-            qty = min(order_size, y_liq, n_liq)
-            if qty >= cfg.min_order_size - _EPS:
-                ev = evaluate_paired_dca_purchase(
-                    snap,
-                    qty,
-                    y_px,
-                    n_px,
-                    combined_cost_target=cfg.target_combined_cost,
-                    max_combined_cost=cfg.max_combined_cost,
-                    require_improvement=True,
-                    min_net_profit_per_pair=0.0,
-                    slippage_reserve=cfg.slippage_reserve,
-                )
-                if ev.decision == PurchaseDecision.BUY:
-                    return ArbitrageDecision(
-                        ArbitrageAction.AVERAGE_DOWN,
-                        "",
-                        qty,
-                        0.0,
-                        ev.reason,
-                        ev.resulting_combined,
-                        paired=True,
-                        yes_limit_price=min(1.0, y_px + cfg.max_slippage),
-                        no_limit_price=min(1.0, n_px + cfg.max_slippage),
-                    )
+        best_side: Optional[str] = None
+        best_ev = None
+        for side, px, liq in (
+            ("YES", y_px, y_liq),
+            ("NO", n_px, n_liq),
+        ):
+            if px <= 0 or liq < cfg.min_order_size - _EPS:
+                continue
+            qty = min(order_size, liq)
+            ev = evaluate_dca_purchase(
+                snap,
+                side,
+                qty,
+                px,
+                combined_cost_target=cfg.target_combined_cost,
+                max_combined_cost=cfg.max_combined_cost,
+                require_improvement=True,
+                min_net_profit_per_pair=0.0,
+                slippage_reserve=cfg.slippage_reserve,
+            )
+            if ev.decision != PurchaseDecision.BUY:
+                continue
+            if best_ev is None or (ev.resulting_combined or 1.0) < (best_ev.resulting_combined or 1.0):
+                best_side, best_ev = side, ev
+        if best_side and best_ev:
+            px = y_px if best_side == "YES" else n_px
+            return ArbitrageDecision(
+                ArbitrageAction.AVERAGE_DOWN,
+                best_side,
+                min(order_size, y_liq if best_side == "YES" else n_liq),
+                px + cfg.max_slippage,
+                best_ev.reason,
+                best_ev.resulting_combined,
+            )
 
     # ── 4) Flat book: first leg ──
     if snap.yes_shares <= _EPS and snap.no_shares <= _EPS:

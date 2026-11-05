@@ -45,6 +45,7 @@ def parse_order_type(order_type: Any):
     candidates = {
         "GTC": "GTC",
         "FOK": "FOK",
+        "FAK": "FAK",
         "GTD": "GTD",
     }
     name = candidates.get(key, key)

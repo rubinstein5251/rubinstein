@@ -1,1 +1,64 @@
-{}
+{
+  "fills": [
+    {
+      "fill_id": "btc:5m:dry-run:BUY:YES:10.000000:0.930000",
+      "worker_key": "btc:5m",
+      "market_id": "0x16cd6463fb52b825e548370cd533119509e36ceddb12166a57f6b54ad6751a2a",
+      "order_id": "dry-run",
+      "side": "YES",
+      "action": "BUY",
+      "price": 0.93,
+      "quantity": 10.0,
+      "fee": 0.0,
+      "timestamp": 1793846938.8419163,
+      "realized_pnl_delta": 0.0
+    },
+    {
+      "fill_id": "btc:5m:dry-run:BUY:NO:10.000000:0.010000",
+      "worker_key": "btc:5m",
+      "market_id": "0x16cd6463fb52b825e548370cd533119509e36ceddb12166a57f6b54ad6751a2a",
+      "order_id": "dry-run",
+      "side": "NO",
+      "action": "BUY",
+      "price": 0.01,
+      "quantity": 10.0,
+      "fee": 0.0,
+      "timestamp": 1793846939.385983,
+      "realized_pnl_delta": 0.0
+    },
+    {
+      "fill_id": "btc:5m:settle:0x16cd6463fb52b825e548370cd533119509e36ceddb12166a57f6b54ad6751a2a:SETTLE:SETTLE:1.000000:1.000000",
+      "worker_key": "btc:5m",
+      "market_id": "0x16cd6463fb52b825e548370cd533119509e36ceddb12166a57f6b54ad6751a2a",
+      "order_id": "settle:0x16cd6463fb52b825e548370cd533119509e36ceddb12166a57f6b54ad6751a2a",
+      "side": "SETTLE",
+      "action": "SETTLE",
+      "price": 1.0,
+      "quantity": 1.0,
+      "fee": 0.0,
+      "timestamp": 1793847008.9408073,
+      "realized_pnl_delta": 0.6
+    }
+  ],
+  "workers": {
+    "btc:5m": {
+      "worker_key": "btc:5m",
+      "realized_pnl": 0.6,
+      "fees_paid": 0.0,
+      "wins": 1,
+      "losses": 0,
+      "fill_count": 3,
+      "updated_at": 1793847008.940856
+    },
+    "eth:5m": {
+      "worker_key": "eth:5m",
+      "realized_pnl": 0.0,
+      "fees_paid": 0.0,
+      "wins": 0,
+      "losses": 0,
+      "fill_count": 0,
+      "updated_at": 0.0
+    }
+  },
+  "updated_at": 1793847008.9409425
+}
